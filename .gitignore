@@ -1,103 +1,80 @@
-# files to ignore for FunAFL repo
+target
+target-bin
+out
+Cargo.lock
+vendor
 
-# environment files
-.vscode/
-__pycache__/
+.DS_Store
+.env
+.vscode
 
-# debug files
+*.test
+*.tmp
+*.swp
+*.o
+*.a
+*.so
+*.out
+*.elf
+*.bin
+*.dll
+*.exe
+*.dylib
+*.dSYM
+*.obj
+
+.cur_input
+.cur_input_*
+cur_input
+.venv
+
+crashes
+
+callgrind.out.*
+perf.data
+perf.data.old
+
+.vscode/settings.json
+test.dict
+
+.idea/
+
+# Ignore all built fuzzers
+AFLplusplus
+test_*
+*_fuzzer
+
+# Ignore common dummy and logfiles
+*.log
+a
+
+forkserver_test
+__pycache__
+*.lafl_lock
+*.metadata
+
+*atomic_file_testfile*
+**/libxml2
+**/corpus_discovered
+**/libxml2-*.tar.gz
+
+libafl_nyx/QEMU-Nyx
+libafl_nyx/packer
+
+.z3-trace
+
+# No gdb history
 .gdb_history
-*_log
+# No llvm IR
+*.ll
 
-# test files
-test/test_hello_aflpp
-test/test_hello_aflpp.c
-test/test_hello_aflpp.sh
-test/errors
-test/core.*
-test/fast-test-fun.sh
+*.tar.gz
 
-# environment file
-fun_env.sh
+# common harness names
+harness
+program
+fuzzer_libpng*
+forkserver_simple
 
-# custom mutator examples
-custom_mutators/examples/
-
-# nyx_mode
-nyx_mode/QEMU-Nyx/
-nyx_mode/libnyx/
-nyx_mode/packer/
-libnyx.so
-
-# build results
-SanitizerCoverageLTO.so
-SanitizerCoveragePCGUARD.so
-afl-analyze
-afl-c++
-afl-c++.8
-afl-cc
-afl-cc.8
-afl-clang
-afl-clang++
-afl-clang-fast
-afl-clang-fast++
-afl-clang-fast++.8
-afl-clang-fast.8
-afl-clang-lto
-afl-clang-lto++
-afl-clang-lto++.8
-afl-clang-lto.8
-afl-compiler-rt-64.o
-afl-compiler-rt.o
-afl-frida-trace.so
-afl-fuzz
-afl-g++
-afl-g++-fast
-afl-g++-fast.8
-afl-gcc
-afl-gcc-cmplog-pass.so
-afl-gcc-cmptrs-pass.so
-afl-gcc-fast
-afl-gcc-fast.8
-afl-gcc-pass.so
-afl-gotcpu
-afl-ld-lto
-afl-llvm-dict2file.so
-afl-llvm-lto-instrumentlist.so
-afl-llvm-pass.so
-afl-llvm-rt-lto-64.o
-afl-llvm-rt-lto.o
-afl-lto
-afl-lto++
-afl-lto++.8
-afl-lto.8
-afl-showmap
-afl-tmin
-cmplog-instructions-pass.so
-cmplog-routines-pass.so
-cmplog-switches-pass.so
-compare-transform-pass.so
-injection-pass.so
-instrumentation/afl-common.o
-instrumentation/afl-llvm-common.o
-libAFLDriver.a
-libAFLQemuDriver.a
-libdislocator.so
-libtokencap.so
-split-compares-pass.so
-split-switches-pass.so
-src/afl-common.o
-src/afl-forkserver.o
-src/afl-performance.o
-src/afl-sharedmem.o
-utils/afl_network_proxy/afl-network-client
-utils/afl_network_proxy/afl-network-server
-utils/aflpp_driver/aflpp_driver.o
-utils/aflpp_driver/aflpp_qemu_driver.o
-utils/aflpp_driver/libAFLDriver.a
-utils/aflpp_driver/libAFLQemuDriver.a
-utils/argv_fuzzing/argv_fuzz_demo
-utils/argv_fuzzing/argv_fuzz_persistent_demo
-utils/argv_fuzzing/argvfuzz64.so
-utils/libdislocator/libdislocator.so
-utils/libtokencap/libtokencap.so
-utils/socket_fuzzing/socketfuzz64.so
+# ignore test fuzzing files
+fuzzers/inprocess/**
