@@ -28,7 +28,8 @@ use libafl::{
         havoc_mutations, token_mutations::I2SRandReplace, tokens_mutations, StdMOptMutator,
         StdScheduledMutator, Tokens,
     },
-    observers::{CanTrack, HitcountsMapObserver, TimeObserver},
+    observers::{CanTrack, TimeObserver},
+    observers::map::StdMapObserver,
     schedulers::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, StdWeightedScheduler,
     },
@@ -50,10 +51,20 @@ use libafl_bolts::{
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use libafl_targets::autotokens;
 use libafl_targets::{
-    libfuzzer_initialize, libfuzzer_test_one_input, std_edges_map_observer, CmpLogObserver,
+    libfuzzer_initialize, libfuzzer_test_one_input, CmpLogObserver,
 };
 #[cfg(unix)]
 use nix::unistd::dup;
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+extern "C" {
+    // 8-bit counters
+    static __start___sancov_cntrs: u8;
+    static __stop___sancov_cntrs: u8;
+    // pc-table
+    static __start___sancov_pcs: usize;
+    static __stop___sancov_pcs: usize;
+}
 
 /// The fuzzer main (as `no_mangle` C function)
 #[no_mangle]
@@ -243,9 +254,25 @@ fn fuzz(
     };
 
     // Create an observation channel using the coverage map
-    // We don't use the hitcounts (see the Cargo.toml, we use pcguard_edges)
-    let edges_observer =
-        HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
+    // let edges_observer =
+    //     HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
+    // in libfun we use sancov cntrs_ptr
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    let edges_observer = unsafe {
+        let start = &__start___sancov_cntrs as *const u8 as usize;
+        let stop = &__stop___sancov_cntrs as *const u8 as usize;
+        let sites = stop.checked_sub(start).expect("sancov cntrs pointers inverted?");
+        let cntrs_ptr = start as *mut u8;
+        // check the length of sites (8-bit counters) and pc-table are consistent
+        let pcs_start = &__start___sancov_pcs as *const usize as usize;
+        let pcs_stop = &__stop___sancov_pcs as *const usize as usize;
+        let word_len = core::mem::size_of::<usize>();
+        let pcs_sites = (pcs_stop - pcs_start) / (2 * word_len);
+        assert_eq!(sites, pcs_sites, "sancov cntrs/pcs size mismatch: {sites} vs {pcs_sites}");
+    
+        // set 8-bit counters observer
+        StdMapObserver::<u8, false>::from_mut_ptr("sancov", cntrs_ptr, sites).track_indices()
+    };
 
     // Create an observation channel to keep track of the execution time
     let time_observer = TimeObserver::new("time");

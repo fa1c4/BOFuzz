@@ -1,11 +1,11 @@
 #include <stdint.h>
 
-__attribute__((weak)) void __sanitizer_cov_trace_pc_guard_init(uint32_t *start,
-                                                               uint32_t *stop) {
-}
+// __attribute__((weak)) void __sanitizer_cov_trace_pc_guard_init(uint32_t *start,
+//                                                                uint32_t *stop) {
+// }
 
-__attribute__((weak)) void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
-}
+// __attribute__((weak)) void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
+// }
 
 __attribute__((weak)) void __cmplog_rtn_hook(uint8_t *ptr1, uint8_t *ptr2) {
 }

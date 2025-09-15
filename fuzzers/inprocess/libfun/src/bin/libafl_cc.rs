@@ -17,7 +17,9 @@ pub fn main() {
         dir.pop();
 
         // Must be always present, even without --libafl
-        args.push("-fsanitize-coverage=trace-pc-guard,trace-cmp".into());
+        // args.push("-fsanitize-coverage=trace-pc-guard,trace-cmp".into());
+        // args.push("-fsanitize-coverage=inline-8bit-counters,pc-table,bb".into());
+        // args.push("-fsanitize-coverage=trace-cmp".into()); // no use when enable CmpLogRtn
 
         let mut cc = ClangWrapper::new();
 
