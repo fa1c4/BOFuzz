@@ -1,3 +1,9 @@
+# ignore test fuzzing files
+fuzzers/inprocess/**
+!fuzzers/inprocess/libfun/
+!fuzzers/inprocess/libfun/**
+
+# original ignore
 target
 target-bin
 out
@@ -75,6 +81,3 @@ harness
 program
 fuzzer_libpng*
 forkserver_simple
-
-# ignore test fuzzing files
-fuzzers/inprocess/**
