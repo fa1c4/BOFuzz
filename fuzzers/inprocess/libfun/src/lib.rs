@@ -10,7 +10,7 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
 };
 
@@ -34,8 +34,7 @@ use libafl::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, StdWeightedScheduler,
     },
     stages::{
-        calibrate::CalibrationStage, power::StdPowerMutationalStage, StdMutationalStage,
-        TracingStage,
+        calibrate::CalibrationStage, StdMutationalStage, TracingStage,
     },
     state::{HasCorpus, StdState},
     Error, HasMetadata,
@@ -55,6 +54,15 @@ use libafl_targets::{
 };
 #[cfg(unix)]
 use nix::unistd::dup;
+
+// libfun mod
+mod feature_sched;
+use crate::feature_sched::{
+    features_map::load_and_align_features_map,
+    FeaturesAccountingStage, FeaturesMapMeta, FactorParams,
+    set_features_enabled, features_enabled,
+    set_factor_params,
+};
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 extern "C" {
@@ -109,6 +117,41 @@ pub extern "C" fn libafl_main() {
                 .help("Timeout for each individual execution, in milliseconds")
                 .default_value("1200"),
         )
+        .arg(
+            Arg::new("features")
+              .long("features-map")
+              .help("Path to {target}_features_map.json")
+          )
+        .arg(
+            Arg::new("alpha")
+                .long("alpha")
+                .default_value("0.2")
+                .help("the <alpha> * features_factor")
+            )
+        .arg(
+            Arg::new("beta")
+                .long("beta")
+                .default_value("0.6")
+                .help("exp(<beta>)")
+            )
+        .arg(
+            Arg::new("gmin")
+                .long("gmin")
+                .default_value("0.5")
+                .help("factor range: (<gmin>, gmax)")
+            )
+        .arg(
+            Arg::new("gmax")
+                .long("gmax")
+                .default_value("3.0")
+                .help("factor range: (gmin, <gmax>)")
+            )
+        .arg(
+            Arg::new("tanh")
+                .long("tanh")
+                .action(clap::ArgAction::SetTrue)
+                .help("use tanh mapping instead of exp")
+            )
         .arg(Arg::new("remaining"))
         .try_get_matches()
     {
@@ -177,7 +220,16 @@ pub extern "C" fn libafl_main() {
             .expect("Could not parse timeout in milliseconds"),
     );
 
-    fuzz(out_dir, crashes, &in_dir, tokens, &logfile, timeout)
+    let cli_features_path = res.get_one::<String>("features").map(PathBuf::from);
+    let params = FactorParams {
+        alpha: res.get_one::<String>("alpha").unwrap().parse().unwrap(),
+        beta:  res.get_one::<String>("beta").unwrap().parse().unwrap(),
+        gmin:  res.get_one::<String>("gmin").unwrap().parse().unwrap(),
+        gmax:  res.get_one::<String>("gmax").unwrap().parse().unwrap(),
+        use_tanh: res.get_flag("tanh"),
+    };
+
+    fuzz(out_dir, crashes, &in_dir, tokens, &logfile, timeout, cli_features_path, params)
         .expect("An error occurred while fuzzing");
 }
 
@@ -215,6 +267,8 @@ fn fuzz(
     tokenfile: Option<PathBuf>,
     logfile: &PathBuf,
     timeout: Duration,
+    cli_features_path: Option<PathBuf>,
+    mut params: FactorParams,
 ) -> Result<(), Error> {
     let log = RefCell::new(OpenOptions::new().append(true).create(true).open(logfile)?);
 
@@ -258,7 +312,7 @@ fn fuzz(
     //     HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
     // in libfun we use sancov cntrs_ptr
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    let edges_observer = unsafe {
+    let (edges_observer, sites) = unsafe {
         let start = &__start___sancov_cntrs as *const u8 as usize;
         let stop = &__stop___sancov_cntrs as *const u8 as usize;
         let sites = stop.checked_sub(start).expect("sancov cntrs pointers inverted?");
@@ -271,8 +325,37 @@ fn fuzz(
         assert_eq!(sites, pcs_sites, "sancov cntrs/pcs size mismatch: {sites} vs {pcs_sites}");
     
         // set 8-bit counters observer
-        StdMapObserver::<u8, false>::from_mut_ptr("sancov", cntrs_ptr, sites).track_indices()
+        let obs = StdMapObserver::<u8, false>::from_mut_ptr("sancov", cntrs_ptr, sites).track_indices();
+        (obs, sites)
     };
+    fn default_features_path() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+        let stem = exe.file_stem()?.to_string_lossy();
+        Some(exe_dir.join(format!("{}_features_map.json", stem)))
+    }
+
+    // use /path_to/the_same_directory/{target_name}_features_map.json file as default file path
+    let chosen_path = if let Some(p) = cli_features_path { Some(p) } else { default_features_path() };
+    let chosen_path = chosen_path.and_then(|p| if p.exists() { Some(p) } else { None });
+
+    let mut pending_feats: Option<Vec<f64>> = None;
+    if let Some(p) = chosen_path.as_ref() {
+        match load_and_align_features_map(p, sites) {
+            Ok(v) => {
+                eprintln!("[features] using features map: {}", p.display());
+                pending_feats = Some(v);
+                set_features_enabled(true);   // enable feature factor
+            }
+            Err(e) => {
+                eprintln!("[features] failed to load {}: {e}. Disabling features.", p.display());
+                set_features_enabled(false);  // disable
+            }
+        }
+    } else {
+        eprintln!("[features] no features map provided/found. Disabling features.");
+        set_features_enabled(false);          // disable
+    }
 
     // Create an observation channel to keep track of the execution time
     let time_observer = TimeObserver::new("time");
@@ -314,6 +397,17 @@ fn fuzz(
         .unwrap()
     });
 
+    // add features_map to metadata
+    if let Some(feats) = pending_feats.take() {
+        state.add_metadata(FeaturesMapMeta { feats });
+    }
+
+    // when disable feature factor then set alpha = 0.0
+    if !features_enabled() {
+        params.alpha = 0.0;
+    }
+    feature_sched::set_factor_params(params.clone());
+
     println!("Let's fuzz :)");
 
     // The actual target run starts here.
@@ -334,18 +428,28 @@ fn fuzz(
         5,
     )?;
 
-    let power: StdPowerMutationalStage<_, _, BytesInput, _, _, _> =
-        StdPowerMutationalStage::new(mutator);
+    // let power: StdPowerMutationalStage<_, _, BytesInput, _, _, _> =
+    //     StdPowerMutationalStage::new(mutator);
+    // energy = perf_score * factor then call mutator according to it
+    let base_mut_stage = StdMutationalStage::new(mutator);
+    let power = feature_sched::FeatureAwarePowerStage::new(base_mut_stage);
 
     // A minimization+queue policy to get testcasess from the corpus
-    let scheduler = IndexesLenTimeMinimizerScheduler::new(
+    // let scheduler = IndexesLenTimeMinimizerScheduler::new(
+    //     &edges_observer,
+    //     StdWeightedScheduler::with_schedule(
+    //         &mut state,
+    //         &edges_observer,
+    //         Some(PowerSchedule::fast()),
+    //     ),
+    // );
+    let weighted = StdWeightedScheduler::with_schedule(
+        &mut state,
         &edges_observer,
-        StdWeightedScheduler::with_schedule(
-            &mut state,
-            &edges_observer,
-            Some(PowerSchedule::fast()),
-        ),
+        Some(PowerSchedule::fast()),
     );
+    
+    let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, weighted);
 
     // A fuzzer with feedbacks and a corpus scheduler
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
@@ -386,7 +490,9 @@ fn fuzz(
     );
 
     // The order of the stages matter!
-    let mut stages = tuple_list!(calibration, tracing, i2s, power);
+    // let mut stages = tuple_list!(calibration, tracing, i2s, power);
+    let feat_stage = FeaturesAccountingStage { map_name: "sancov" };
+    let mut stages = tuple_list!(calibration, tracing, feat_stage, i2s, power);
 
     // Read tokens
     if state.metadata_map().get::<Tokens>().is_none() {
