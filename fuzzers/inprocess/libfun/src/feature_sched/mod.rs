@@ -6,13 +6,13 @@ pub mod stats;
 pub mod metadata;
 pub mod factor;
 pub mod accounting_stage;
-pub mod power_stage;
+pub mod sancov_index_feedback;
 
 // re-export for convenience
-pub use factor::{FactorParams, compute_factor};
+pub use factor::FactorParams;
 pub use accounting_stage::FeaturesAccountingStage;
-pub use metadata::{FeaturesMapMeta, GlobalStatsMeta, PathWeightMeta};
-pub use power_stage::FeatureAwarePowerStage;
+pub use metadata::{FeaturesMapMeta, SancovIndexesMetadata};
+pub use sancov_index_feedback::SancovIndexFeedback;
 
 use std::sync::{OnceLock, atomic::{AtomicBool, Ordering}};
 

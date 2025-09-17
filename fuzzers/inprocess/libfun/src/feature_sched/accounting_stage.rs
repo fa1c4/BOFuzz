@@ -3,38 +3,36 @@ feature_sched/accounting_stage.rs: calculate the features factor and set to meta
 */
 use libafl::{
     stages::Stage, executors::Executor, events::EventFirer,
-    observers::ObserversTuple,
+    observers::{ObserversTuple, MapObserver},
+    executors::HasObservers,
+    common::HasMetadata,
+    state::HasCorpus,
+    inputs::BytesInput,
+    corpus::Corpus,
     Error,
-    feedbacks::MapIndexesMetadata,
 };
-use libafl::executors::HasObservers;
-use libafl::common::HasMetadata;
-use libafl::state::HasCorpus;
-use libafl::inputs::BytesInput;
-use libafl::corpus::Corpus; // current(), get(), get_mut()     
-use libafl_bolts::tuples::MatchName;       
+use libafl_bolts::{tuples::{Handle, MatchNameRef}, AsIter};
 use super::metadata::{PathWeightMeta, GlobalStatsMeta, FeaturesMapMeta};
 use super::stats::WeightStats;
-use crate::feature_sched::features_enabled;
+use crate::feature_sched::{features_enabled, SancovIndexesMetadata};
 
 use libafl::schedulers::testcase_score::ExternalPerfMultMeta;
 use super::factor::compute_factor;
 use crate::feature_sched::get_factor_params;
 
-pub struct FeaturesAccountingStage {
-    pub map_name: &'static str, // like "sancov"
+pub struct FeaturesAccountingStage<C> {
+    // pub map_name: &'static str,
+    pub handle: Handle<C>,
+    pub _p: core::marker::PhantomData<C>,
 }
 
-impl Default for FeaturesAccountingStage {
-    fn default() -> Self { Self { map_name: "sancov" } }
-}
-
-impl<E, EM, S, Z> Stage<E, EM, S, Z> for FeaturesAccountingStage
+impl<E, EM, S, Z, C> Stage<E, EM, S, Z> for FeaturesAccountingStage<C>
 where
     E: Executor<EM, BytesInput, S, Z> + HasObservers,
     EM: EventFirer<BytesInput, S>,
     S: HasMetadata + HasCorpus<BytesInput>,
-    E::Observers: ObserversTuple<BytesInput, S>,
+    E::Observers: ObserversTuple<BytesInput, S> + MatchNameRef,
+    C: MapObserver<Entry = u8> + for<'it> AsIter<'it, Item = u8>,
 {
     fn perform(
         &mut self,
@@ -56,28 +54,65 @@ where
         let Some(cid_ref) = state.corpus().current() else { return Ok(()); };
         let cid = *cid_ref;
 
-        // 1) read hit indices from MapIndexesMetadata
-        let indices: Vec<usize> = {
-            let entry = state.corpus().get(cid)?.borrow();
-            match entry.metadata_map().get::<MapIndexesMetadata>() {
-                Some(meta) => meta.list.clone(), // field, not method, in your libafl
-                None => return Ok(()), // nothing tracked yet
+        // 0) corpus entry sancov indices lazy fill | maybe overhead
+        {
+            let need_fill = {
+                let entry = state.corpus().get(cid)?.borrow();
+                entry.metadata_map().get::<SancovIndexesMetadata>().is_none()
+            };
+            if need_fill {
+                let obs_ref = executor.observers();
+                let sancov: &C = obs_ref
+                    .get(&self.handle)
+                    .ok_or_else(|| Error::unknown("sancov observer not found".to_string()))?;
+    
+                let init = sancov.initial();
+                let mut idx = Vec::new();
+                for (i, v) in sancov.as_iter().enumerate() {
+                    if *v != init { idx.push(i); }
+                }
+                if !idx.is_empty() {
+                    let mut entry = state.corpus().get(cid)?.borrow_mut();
+                    entry.add_metadata(SancovIndexesMetadata::new(idx));
+                }
             }
-        };
-
-        // 2) features map
-        let feats = state
-            .metadata_map()
-            .get::<FeaturesMapMeta>()
-            .expect("FeaturesMapMeta not in State")
-            .feats
-            .as_slice();
-
-        // 3) accumulate path weight
-        let mut w = 0.0;
-        for &i in &indices {
-            if i < feats.len() { w += feats[i]; }
         }
+
+        // // 1) read hit indices from SancovIndexesMetadata
+        // let indices: Vec<usize> = {
+        //     let entry = state.corpus().get(cid)?.borrow();
+        //     match entry.metadata_map().get::<SancovIndexesMetadata>() {
+        //         Some(meta) => meta.list.clone(), // field, not method, in your libafl
+        //         None => return Ok(()), // nothing tracked yet
+        //     }
+        // };
+
+        // // 2) features map
+        // let feats = state
+        //     .metadata_map()
+        //     .get::<FeaturesMapMeta>()
+        //     .expect("FeaturesMapMeta not in State")
+        //     .feats
+        //     .as_slice();
+
+        // // 3) accumulate path weight
+        // let mut w = 0.0;
+        // for &i in &indices {
+        //     if i < feats.len() { w += feats[i]; }
+        // }
+
+        // 1-3) borrow and accumulate
+        let w = {
+            let entry = state.corpus().get(cid)?.borrow();
+            let meta = match entry.metadata_map().get::<SancovIndexesMetadata>() {
+                Some(m) => m,
+                None => return Ok(()),
+            };
+            let feats = state.metadata_map().get::<FeaturesMapMeta>()
+                .expect("FeaturesMapMeta not in State").feats.as_slice();
+        
+            meta.list.iter().fold(0.0, |acc, &i| acc + feats.get(i).copied().unwrap_or(0.0))
+        };
 
         // 4) write PathWeightMeta back to current testcase
         {

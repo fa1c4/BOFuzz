@@ -30,7 +30,7 @@ which = "6.0.3"
 libafl = { path = "../../../libafl" }
 libafl_bolts = { path = "../../../libafl_bolts" }
 libafl_targets = { path = "../../../libafl_targets", features = [
-  # "sancov_pcguard_hitcounts",
+  "sancov_pcguard_hitcounts",
   "sancov_cmplog",
   "libfuzzer",
 ] }

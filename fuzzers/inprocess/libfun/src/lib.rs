@@ -31,7 +31,7 @@ use libafl::{
         havoc_mutations, token_mutations::I2SRandReplace, tokens_mutations, StdMOptMutator,
         StdScheduledMutator, Tokens,
     },
-    observers::{CanTrack, TimeObserver},
+    observers::{CanTrack, TimeObserver, HitcountsMapObserver},
     observers::map::StdMapObserver,
     schedulers::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, StdWeightedScheduler,
@@ -47,13 +47,13 @@ use libafl_bolts::{
     os::dup2,
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
-    tuples::{tuple_list, Merge},
+    tuples::{tuple_list, Merge, Handled},
     AsSlice,
 };
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use libafl_targets::autotokens;
 use libafl_targets::{
-    libfuzzer_initialize, libfuzzer_test_one_input, CmpLogObserver,
+    libfuzzer_initialize, libfuzzer_test_one_input, CmpLogObserver, std_edges_map_observer,
 };
 #[cfg(unix)]
 use nix::unistd::dup;
@@ -64,11 +64,12 @@ use crate::feature_sched::{
     features_map::load_and_align_features_map,
     FeaturesAccountingStage, FeaturesMapMeta, FactorParams,
     set_features_enabled, features_enabled,
-    set_factor_params,
+    SancovIndexFeedback,
 };
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 extern "C" {
+    // fn __sanitizer_cov_reset_counters(); // reset map for each testcase | not linked 
     // 8-bit counters
     static __start___sancov_cntrs: u8;
     static __stop___sancov_cntrs: u8;
@@ -311,26 +312,27 @@ fn fuzz(
     };
 
     // Create an observation channel using the coverage map
-    // let edges_observer =
-    //     HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
-    // in libfun we use sancov cntrs_ptr
+    let edges_observer =
+        HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
+    // in libfun we use sancov cntrs_ptr to align indices with static features
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    let (edges_observer, sites) = unsafe {
+    let (sancov_observer, sancov_sites, cntrs_ptr) = unsafe {
         let start = &__start___sancov_cntrs as *const u8 as usize;
         let stop = &__stop___sancov_cntrs as *const u8 as usize;
-        let sites = stop.checked_sub(start).expect("sancov cntrs pointers inverted?");
+        let sancov_sites = stop.checked_sub(start).expect("sancov cntrs pointers inverted?");
         let cntrs_ptr = start as *mut u8;
         // check the length of sites (8-bit counters) and pc-table are consistent
         let pcs_start = &__start___sancov_pcs as *const usize as usize;
         let pcs_stop = &__stop___sancov_pcs as *const usize as usize;
         let word_len = core::mem::size_of::<usize>();
         let pcs_sites = (pcs_stop - pcs_start) / (2 * word_len);
-        assert_eq!(sites, pcs_sites, "sancov cntrs/pcs size mismatch: {sites} vs {pcs_sites}");
+        assert_eq!(sancov_sites, pcs_sites, "sancov cntrs/pcs size mismatch: {sancov_sites} vs {pcs_sites}");
     
         // set 8-bit counters observer
-        let obs = StdMapObserver::<u8, false>::from_mut_ptr("sancov", cntrs_ptr, sites).track_indices();
-        (obs, sites)
+        let obs = StdMapObserver::<u8, false>::from_mut_ptr("sancov", cntrs_ptr, sancov_sites);
+        (obs, sancov_sites, cntrs_ptr)
     };
+    let sancov_handle = sancov_observer.handle();
     fn default_features_path() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
@@ -344,7 +346,7 @@ fn fuzz(
 
     let mut pending_feats: Option<Vec<f64>> = None;
     if let Some(p) = chosen_path.as_ref() {
-        match load_and_align_features_map(p, sites) {
+        match load_and_align_features_map(p, sancov_sites) {
             Ok(v) => {
                 eprintln!("[features] using features map: {}", p.display());
                 pending_feats = Some(v);
@@ -366,6 +368,7 @@ fn fuzz(
     let cmplog_observer = CmpLogObserver::new("cmplog", true);
 
     let map_feedback = MaxMapFeedback::new(&edges_observer);
+    let sancov_idx_fb = SancovIndexFeedback::new(&sancov_observer);
 
     let calibration = CalibrationStage::new(&map_feedback);
 
@@ -375,7 +378,8 @@ fn fuzz(
         // New maximization map feedback linked to the edges observer and the feedback state
         map_feedback,
         // Time feedback, this one does not need a feedback state
-        TimeFeedback::new(&time_observer)
+        TimeFeedback::new(&time_observer),
+        sancov_idx_fb
     );
 
     // A feedback to choose if an input is a solution or not
@@ -449,6 +453,10 @@ fn fuzz(
 
     // The wrapped harness function, calling out to the LLVM-style harness
     let mut harness = |input: &BytesInput| {
+        // reset the inline-counters map for each testcase
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        unsafe { core::ptr::write_bytes(cntrs_ptr, 0, sancov_sites); }
+
         let target = input.target_bytes();
         let buf = target.as_slice();
         unsafe {
@@ -462,7 +470,8 @@ fn fuzz(
     // Create the executor for an in-process function with one observer for edge coverage and one for the execution time
     let mut executor = InProcessExecutor::with_timeout(
         &mut harness,
-        tuple_list!(edges_observer, time_observer),
+        // tuple_list!(edges_observer, time_observer),
+        tuple_list!(edges_observer, sancov_observer, time_observer),
         &mut fuzzer,
         &mut state,
         &mut mgr,
@@ -484,7 +493,11 @@ fn fuzz(
 
     // The order of the stages matter!
     // let mut stages = tuple_list!(calibration, tracing, i2s, power);
-    let feat_stage = FeaturesAccountingStage { map_name: "sancov" };
+    let feat_stage = FeaturesAccountingStage {
+        // map_name: "sancov",
+        handle: sancov_handle,
+        _p: core::marker::PhantomData,
+    };
     let mut stages = tuple_list!(calibration, tracing, feat_stage, i2s, power);
 
     // Read tokens

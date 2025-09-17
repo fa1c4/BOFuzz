@@ -1,5 +1,5 @@
 /*
-feature_sched/factors.rs: calculate the features factor
+feature_sched/factor.rs: calculate the features factor
 */
 use super::metadata::{GlobalStatsMeta, PathWeightMeta};
 // use libafl::state::HasMetadata;
