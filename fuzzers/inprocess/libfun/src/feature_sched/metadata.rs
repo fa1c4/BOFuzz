@@ -1,3 +1,6 @@
+/*
+feature_sched/metadata.rs: define metadata structures
+*/
 use serde::{Serialize, Deserialize};
 use libafl_bolts::SerdeAny;
 

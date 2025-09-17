@@ -13,6 +13,12 @@ use crate::{
     state::HasCorpus,
     Error, HasMetadata,
 };
+// for libfun metadata usage
+use serde::{Deserialize, Serialize};
+use libafl_bolts::SerdeAny;
+
+#[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
+pub struct ExternalPerfMultMeta(pub f64);
 
 /// Compute the favor factor of a [`Testcase`]. Higher is better.
 pub trait TestcaseScore<I, S> {
@@ -247,6 +253,14 @@ where
         // Upper bound
         if perf_score > HAVOC_MAX_MULT * 100.0 {
             perf_score = HAVOC_MAX_MULT * 100.0;
+        }
+
+        // [allow exceed upper bound] libfun features factor 
+        if let Some(mult) = entry.metadata_map().get::<ExternalPerfMultMeta>() {
+            let m = mult.0;
+            if m.is_finite() && (m - 1.0).abs() > 1e-12 && m > 0.0 {
+                perf_score *= m;
+            }
         }
 
         if entry.objectives_found() > 0 && psmeta.strat().is_some_and(|s| s.avoid_crash()) {

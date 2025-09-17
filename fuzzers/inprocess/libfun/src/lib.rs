@@ -1,4 +1,7 @@
 //! A singlethreaded libfuzzer-like fuzzer that can auto-restart.
+/*
+lib.rs: libfun fuzzer main entry
+*/
 use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -34,7 +37,7 @@ use libafl::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, StdWeightedScheduler,
     },
     stages::{
-        calibrate::CalibrationStage, StdMutationalStage, TracingStage,
+        calibrate::CalibrationStage, StdMutationalStage, TracingStage, power::StdPowerMutationalStage,
     },
     state::{HasCorpus, StdState},
     Error, HasMetadata,
@@ -428,28 +431,18 @@ fn fuzz(
         5,
     )?;
 
-    // let power: StdPowerMutationalStage<_, _, BytesInput, _, _, _> =
-    //     StdPowerMutationalStage::new(mutator);
-    // energy = perf_score * factor then call mutator according to it
-    let base_mut_stage = StdMutationalStage::new(mutator);
-    let power = feature_sched::FeatureAwarePowerStage::new(base_mut_stage);
+    let power: StdPowerMutationalStage<_, _, BytesInput, _, _, _> =
+        StdPowerMutationalStage::new(mutator);
 
     // A minimization+queue policy to get testcasess from the corpus
-    // let scheduler = IndexesLenTimeMinimizerScheduler::new(
-    //     &edges_observer,
-    //     StdWeightedScheduler::with_schedule(
-    //         &mut state,
-    //         &edges_observer,
-    //         Some(PowerSchedule::fast()),
-    //     ),
-    // );
-    let weighted = StdWeightedScheduler::with_schedule(
-        &mut state,
+    let scheduler = IndexesLenTimeMinimizerScheduler::new(
         &edges_observer,
-        Some(PowerSchedule::fast()),
+        StdWeightedScheduler::with_schedule(
+            &mut state,
+            &edges_observer,
+            Some(PowerSchedule::fast()),
+        ),
     );
-    
-    let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, weighted);
 
     // A fuzzer with feedbacks and a corpus scheduler
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);

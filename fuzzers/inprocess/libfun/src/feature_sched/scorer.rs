@@ -1,3 +1,7 @@
+/*
+No use after version v0.3+
+*/
+
 use libafl::{
     schedulers::testcase_score::{TestcaseScore, CorpusPowerTestcaseScore},
     corpus::Testcase,

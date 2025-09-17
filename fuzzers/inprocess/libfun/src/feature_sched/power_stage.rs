@@ -1,3 +1,7 @@
+/*
+No use after version v0.3+
+*/
+
 use core::marker::PhantomData;
 
 use libafl::{

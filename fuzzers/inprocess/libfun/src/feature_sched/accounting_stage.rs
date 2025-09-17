@@ -1,3 +1,6 @@
+/*
+feature_sched/accounting_stage.rs: calculate the features factor and set to metadata
+*/
 use libafl::{
     stages::Stage, executors::Executor, events::EventFirer,
     observers::ObserversTuple,
@@ -13,6 +16,10 @@ use libafl_bolts::tuples::MatchName;
 use super::metadata::{PathWeightMeta, GlobalStatsMeta, FeaturesMapMeta};
 use super::stats::WeightStats;
 use crate::feature_sched::features_enabled;
+
+use libafl::schedulers::testcase_score::ExternalPerfMultMeta;
+use super::factor::compute_factor;
+use crate::feature_sched::get_factor_params;
 
 pub struct FeaturesAccountingStage {
     pub map_name: &'static str, // like "sancov"
@@ -38,6 +45,11 @@ where
     ) -> Result<(), Error> {
         // disable features factor then return directly
         if !features_enabled() {
+            if let Some(cid_ref) = state.corpus().current() {
+                let cid = *cid_ref;
+                let mut entry = state.corpus().get(cid)?.borrow_mut();
+                let _ = entry.remove_metadata::<ExternalPerfMultMeta>();
+            }
             return Ok(());
         }
 
@@ -73,7 +85,18 @@ where
             entry.add_metadata(PathWeightMeta { w });
         }
 
-        // 5) update global stats
+        // 5) calculate feat_factor
+        let feat_factor = {
+            let params = get_factor_params();
+            let entry_borrow = state.corpus().get(cid)?.borrow();
+            compute_factor(params, state, &*entry_borrow)
+        };
+        {
+            let mut entry = state.corpus().get(cid)?.borrow_mut();
+            entry.add_metadata(ExternalPerfMultMeta(feat_factor));
+        }
+
+        // 6) update global stats
         if !state.has_metadata::<GlobalStatsMeta>() {
             state.add_metadata(GlobalStatsMeta { stats: WeightStats::default() });
         }

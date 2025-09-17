@@ -1,3 +1,6 @@
+/*
+feature_sched/stats.rs: define WeightStats
+*/
 use serde::{Serialize, Deserialize};
 use libafl_bolts::SerdeAny;
 

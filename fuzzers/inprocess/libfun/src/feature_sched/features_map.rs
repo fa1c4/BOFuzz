@@ -1,3 +1,6 @@
+/*
+feature_sched/features_map.rs: load and parse the features_map.json data
+*/
 use serde::Deserialize;
 use std::{fs::File, io::Read, path::Path};
 

@@ -1,3 +1,6 @@
+/*
+feature_sched/mod.rs: export packages
+*/
 pub mod features_map;
 pub mod stats;
 pub mod metadata;
