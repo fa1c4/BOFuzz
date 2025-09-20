@@ -391,10 +391,10 @@ fn fuzz(
             // RNG
             StdRand::new(),
             // Corpus that will be evolved, we keep it in memory for performance
-            InMemoryOnDiskCorpus::new(corpus_dir).unwrap(),
+            InMemoryOnDiskCorpus::new(corpus_dir.clone()).unwrap(),
             // Corpus in which we store solutions (crashes in this example),
             // on disk so the user can get them after stopping the fuzzer
-            OnDiskCorpus::new(objective_dir).unwrap(),
+            OnDiskCorpus::new(objective_dir.clone()).unwrap(),
             // States of the feedbacks.
             // The feedbacks can report the data that should persist in the State.
             &mut feedback,
@@ -414,6 +414,32 @@ fn fuzz(
         params.alpha = 0.0;
     }
     feature_sched::set_factor_params(params.clone());
+
+    eprintln!(
+        "[params] alpha={:.3}, beta={:.3}, gmin={:.3}, gmax={:.3}, use_tanh={}",
+        params.alpha, params.beta, params.gmin, params.gmax, params.use_tanh
+    );
+    eprintln!(
+        "[params] features_enabled={}, features_map={}",
+        features_enabled(),
+        chosen_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".into())
+    );
+    eprintln!(
+        "[params] timeout_ms={}, corpus_dir={}, crashes_dir={}, seeds_dir={}, tokens={}",
+        timeout.as_millis(),
+        corpus_dir.display(),
+        objective_dir.display(),
+        seed_dir.display(),
+        tokenfile
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".into())
+    );
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    eprintln!("[params] sancov_sites={}", sancov_sites);
 
     println!("Let's fuzz :)");
 
