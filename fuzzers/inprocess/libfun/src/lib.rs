@@ -15,6 +15,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use clap::{Arg, Command};
@@ -57,13 +58,16 @@ use libafl_targets::{
 };
 #[cfg(unix)]
 use nix::unistd::dup;
+use crate::feature_sched::{FEATURES_ACTIVE, FUZZ_START};
+use std::time::Instant;
 
 // libfun mod
 mod feature_sched;
 use crate::feature_sched::{
     features_map::load_and_align_features_map,
     FeaturesAccountingStage, FeaturesMapMeta, FactorParams,
-    set_features_enabled, features_enabled,
+    set_features_enabled, features_enabled, 
+    set_factor_params, get_factor_params,
     SancovIndexFeedback,
 };
 
@@ -276,6 +280,12 @@ fn fuzz(
 ) -> Result<(), Error> {
     let log = RefCell::new(OpenOptions::new().append(true).create(true).open(logfile)?);
 
+    // record startup time
+    unsafe { 
+        FUZZ_START = Some(Instant::now()); 
+        eprintln!("[features] FUZZ_START: {:?}", FUZZ_START);
+    }
+
     #[cfg(unix)]
     let mut stdout_cpy = unsafe {
         let new_fd = dup(io::stdout().as_raw_fd())?;
@@ -291,6 +301,20 @@ fn fuzz(
         #[cfg(windows)]
         println!("{s}");
         writeln!(log.borrow_mut(), "{:?} {s}", current_time()).unwrap();
+        
+        let features_status = if FEATURES_ACTIVE.load(Ordering::Relaxed) {
+            "enabled"
+        } else {
+            "disabled"
+        };
+
+        let params = get_factor_params();
+        writeln!(
+            log.borrow_mut(),
+            "[Features Status] Current features: {features_status}, \
+            alpha: {:.2}, beta: {:.2}, gmin: {:.2}, gmax: {:.2}, use_tanh: {}",
+            params.alpha, params.beta, params.gmin, params.gmax, params.use_tanh
+        ).unwrap();
     });
 
     // We need a shared map to store our state before a crash.
@@ -409,11 +433,15 @@ fn fuzz(
         state.add_metadata(FeaturesMapMeta { feats });
     }
 
+    // set startup mode as default
+    eprintln!("Startup with default mode, disable features heuristic method...");
+    set_features_enabled(false);
+
     // when disable feature factor then set alpha = 0.0
     if !features_enabled() {
         params.alpha = 0.0;
     }
-    feature_sched::set_factor_params(params.clone());
+    set_factor_params(params.clone());
 
     eprintln!(
         "[params] alpha={:.3}, beta={:.3}, gmin={:.3}, gmax={:.3}, use_tanh={}",

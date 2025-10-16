@@ -1,6 +1,11 @@
 /*
 feature_sched/accounting_stage.rs: calculate the features factor and set to metadata
 */
+use std::time::{Instant, Duration};
+use std::sync::atomic::Ordering;
+use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::Write;
 use libafl::{
     stages::Stage, executors::Executor, events::EventFirer,
     observers::{ObserversTuple, MapObserver},
@@ -14,7 +19,8 @@ use libafl::{
 use libafl_bolts::{tuples::{Handle, MatchNameRef}, AsIter};
 use super::metadata::{PathWeightMeta, GlobalStatsMeta, FeaturesMapMeta};
 use super::stats::WeightStats;
-use crate::feature_sched::{features_enabled, SancovIndexesMetadata};
+use crate::feature_sched::{FEATURES_ACTIVE, FUZZ_START, features_enabled, 
+                            set_features_enabled, set_factor_params, SancovIndexesMetadata};
 
 use libafl::schedulers::testcase_score::ExternalPerfMultMeta;
 use super::factor::compute_factor;
@@ -124,7 +130,7 @@ where
         let feat_factor = {
             let params = get_factor_params();
             let entry_borrow = state.corpus().get(cid)?.borrow();
-            compute_factor(params, state, &*entry_borrow)
+            compute_factor(&params, state, &*entry_borrow)
         };
         {
             let mut entry = state.corpus().get(cid)?.borrow_mut();
@@ -141,6 +147,26 @@ where
         Ok(())
     }
 
-    fn should_restart(&mut self, _state: &mut S) -> Result<bool, Error> { Ok(false) }
+    fn should_restart(&mut self, _state: &mut S) -> Result<bool, Error> { 
+        let start_time = unsafe { FUZZ_START.unwrap_or_else(Instant::now) }; // Use FUZZ_START or set current time if not initialized
+        let elapsed = start_time.elapsed();
+
+        // hours delay before enabling features (modify the duration as needed)
+        let cold_start_duration = Duration::from_secs(12 * 60 * 60);
+
+        // If elapsed time is greater than or equal to the cold start duration, enable the feature
+        if !FEATURES_ACTIVE.load(Ordering::Relaxed) && elapsed >= cold_start_duration {
+            // Log and enable the feature
+            FEATURES_ACTIVE.store(true, Ordering::Relaxed);
+            let mut params = get_factor_params();
+            params.alpha = 1.0;
+            set_factor_params(params);
+            set_features_enabled(true);
+
+            return Ok(true); // Return true to trigger `perform`
+        }
+
+        Ok(false) // Return false if the cold start time has not yet elapsed
+    }
     fn clear_progress(&mut self, _state: &mut S) -> Result<(), Error> { Ok(()) }
 }

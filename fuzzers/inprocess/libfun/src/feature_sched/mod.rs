@@ -14,23 +14,35 @@ pub use accounting_stage::FeaturesAccountingStage;
 pub use metadata::{FeaturesMapMeta, SancovIndexesMetadata};
 pub use sancov_index_feedback::SancovIndexFeedback;
 
-use std::sync::{OnceLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{RwLock, atomic::{AtomicBool, Ordering}};
+use std::time::Instant;
+use std::sync::Arc;
 
+// set features active flag
+pub static FEATURES_ACTIVE: AtomicBool = AtomicBool::new(false);
 // features enable switch
 pub static FEAT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+// startup time record
+pub static mut FUZZ_START: Option<Instant> = None;
+
 pub fn features_enabled() -> bool { FEAT_ENABLED.load(Ordering::Relaxed) }
 pub fn set_features_enabled(v: bool) { FEAT_ENABLED.store(v, Ordering::Relaxed); }
 
 // factor global params store and get
-static FACTOR_PARAMS: OnceLock<FactorParams> = OnceLock::new();
+// Use RwLock to allow for mutable access to params
+pub static FACTOR_PARAMS: RwLock<FactorParams> = RwLock::new(FactorParams { 
+    alpha: 1.0, beta: 0.6, gmin: 0.0, gmax: 3.0, use_tanh: false 
+});
 
-// setting global params and only set at the starting
+// Function to set the factor parameters
 pub fn set_factor_params(p: FactorParams) {
-    let _ = FACTOR_PARAMS.set(p);
+    let mut params = FACTOR_PARAMS.write().unwrap();
+    *params = p;
 }
 
-// getting the params otherwise set the alpha as 0.0
-pub fn get_factor_params() -> &'static FactorParams {
-    static DEFAULT: FactorParams = FactorParams { alpha: 0.0, beta: 0.6, gmin: 0.5, gmax: 3.0, use_tanh: false };
-    FACTOR_PARAMS.get().unwrap_or(&DEFAULT)
+// Function to get the factor parameters
+pub fn get_factor_params() -> FactorParams {
+    let params = FACTOR_PARAMS.read().unwrap();
+    params.clone() // Clone to avoid borrowing issues
 }

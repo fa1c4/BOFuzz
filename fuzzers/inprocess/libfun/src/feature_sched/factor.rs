@@ -8,16 +8,16 @@ use crate::feature_sched::features_enabled;
 
 #[derive(Clone, Debug)]
 pub struct FactorParams {
-    pub alpha: f64, // 0.0 ~ 0.6
+    pub alpha: f64, // 0.0 ~ 1.0
     pub beta: f64,  // slope of exp/tanh: 0.4 ~ 0.8
-    pub gmin: f64,  // 0.5
+    pub gmin: f64,  // 0.0
     pub gmax: f64,  // 3.0
     pub use_tanh: bool,
 }
 
 impl Default for FactorParams {
     fn default() -> Self {
-        Self { alpha: 0.2, beta: 0.6, gmin: 0.5, gmax: 3.0, use_tanh: false }
+        Self { alpha: 0.0, beta: 0.6, gmin: 0.0, gmax: 3.0, use_tanh: false }
     }
 }
 
