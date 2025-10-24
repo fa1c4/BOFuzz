@@ -47,6 +47,6 @@ pub fn compute_factor<S: HasMetadata>(params: &FactorParams, state: &S, entry: &
     if !g.is_finite() { g = 1.0; }
     g = g.clamp(params.gmin, params.gmax);
 
-    // 1.0 + alpha*(g-1.0)
+    // 1.0 + alpha * (g - 1.0)
     1.0 + params.alpha * (g - 1.0)
 }

@@ -66,10 +66,16 @@ mod feature_sched;
 use crate::feature_sched::{
     features_map::load_and_align_features_map,
     FeaturesAccountingStage, FeaturesMapMeta, FactorParams,
-    set_features_enabled, features_enabled, 
+    recompute_features_enabled, features_enabled, 
     set_factor_params, get_factor_params,
     SancovIndexFeedback,
+    set_feat_exists, feat_exists,
+    V_CANDIDATES, get_current_weight_vec,
 };
+
+use libafl::schedulers::testcase_score::{get_feat_mode, set_feat_mode};
+use crate::feature_sched::{set_feat0, get_feat0};
+use crate::feature_sched::{set_alpha_init, get_alpha_init};
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 extern "C" {
@@ -80,6 +86,18 @@ extern "C" {
     // pc-table
     static __start___sancov_pcs: usize;
     static __stop___sancov_pcs: usize;
+}
+
+// format vector printing
+fn fmt_vec_short(v: &[f64], maxn: usize) -> String {
+    let n = v.len();
+    let take = n.min(maxn);
+    let mut s = v[..take].iter()
+        .map(|x| format!("{:.3}", x))
+        .collect::<Vec<_>>()
+        .join(",");
+    if n > take { s.push_str(",..."); }
+    format!("[{}] (len={})", s, n)
 }
 
 /// The fuzzer main (as `no_mangle` C function)
@@ -160,6 +178,13 @@ pub extern "C" fn libafl_main() {
                 .action(clap::ArgAction::SetTrue)
                 .help("use tanh mapping instead of exp")
             )
+        .arg(
+            Arg::new("feat-mode")
+                .long("feat-mode")
+                .value_parser(clap::value_parser!(u8).range(0..=3))
+                .default_value("0")
+                .help("0: off, 1: weight only, 2: power only, 3: both")
+            )
         .arg(Arg::new("remaining"))
         .try_get_matches()
     {
@@ -237,6 +262,12 @@ pub extern "C" fn libafl_main() {
         use_tanh: res.get_flag("tanh"),
     };
 
+    set_alpha_init(params.alpha);
+
+    let feat_mode: u8 = *res.get_one::<u8>("feat-mode").unwrap();
+    set_feat_mode(feat_mode);
+    eprintln!("[params] feat_mode={}", feat_mode);
+
     fuzz(out_dir, crashes, &in_dir, tokens, &logfile, timeout, cli_features_path, params)
         .expect("An error occurred while fuzzing");
 }
@@ -302,18 +333,27 @@ fn fuzz(
         println!("{s}");
         writeln!(log.borrow_mut(), "{:?} {s}", current_time()).unwrap();
         
-        let features_status = if FEATURES_ACTIVE.load(Ordering::Relaxed) {
-            "enabled"
-        } else {
-            "disabled"
-        };
+        let features_status = if FEATURES_ACTIVE.load(Ordering::Relaxed) { "enabled" } else { "disabled" };
 
         let params = get_factor_params();
+
+        let (cand_cnt, cur_v_str) = {
+            let cnt = V_CANDIDATES.read().unwrap().len();
+            let cur = get_current_weight_vec();
+            (cnt, fmt_vec_short(&cur, 8))
+        };
+
         writeln!(
             log.borrow_mut(),
-            "[Features Status] Current features: {features_status}, \
-            alpha: {:.2}, beta: {:.2}, gmin: {:.2}, gmax: {:.2}, use_tanh: {}",
-            params.alpha, params.beta, params.gmin, params.gmax, params.use_tanh
+            "[Features Status] enabled={}, active={}, feat_mode={}, feat_exists={}, alpha={:.2}, beta={:.2}, gmin:{:.2}, gmax:{:.2}, use_tanh:{}, v_candidates:{}, current_v:{}, features_map[0]:{}",
+            features_enabled(),
+            features_status,
+            get_feat_mode(),
+            feat_exists(),
+            params.alpha, params.beta, params.gmin, params.gmax, params.use_tanh,
+            cand_cnt,
+            cur_v_str,
+            get_feat0(),
         ).unwrap();
     });
 
@@ -374,16 +414,16 @@ fn fuzz(
             Ok(v) => {
                 eprintln!("[features] using features map: {}", p.display());
                 pending_feats = Some(v);
-                set_features_enabled(true);   // enable feature factor
+                set_feat_exists(true);
             }
             Err(e) => {
                 eprintln!("[features] failed to load {}: {e}. Disabling features.", p.display());
-                set_features_enabled(false);  // disable
+                set_feat_exists(false);
             }
         }
     } else {
         eprintln!("[features] no features map provided/found. Disabling features.");
-        set_features_enabled(false);          // disable
+        set_feat_exists(false);
     }
 
     // Create an observation channel to keep track of the execution time
@@ -435,7 +475,7 @@ fn fuzz(
 
     // set startup mode as default
     eprintln!("Startup with default mode, disable features heuristic method...");
-    set_features_enabled(false);
+    recompute_features_enabled();
 
     // when disable feature factor then set alpha = 0.0
     if !features_enabled() {

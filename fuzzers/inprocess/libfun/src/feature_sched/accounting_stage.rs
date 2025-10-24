@@ -20,11 +20,12 @@ use libafl_bolts::{tuples::{Handle, MatchNameRef}, AsIter};
 use super::metadata::{PathWeightMeta, GlobalStatsMeta, FeaturesMapMeta};
 use super::stats::WeightStats;
 use crate::feature_sched::{FEATURES_ACTIVE, FUZZ_START, features_enabled, 
-                            set_features_enabled, set_factor_params, SancovIndexesMetadata};
+                            recompute_features_enabled, set_factor_params, SancovIndexesMetadata};
 
 use libafl::schedulers::testcase_score::ExternalPerfMultMeta;
+use libafl::schedulers::testcase_score::get_feat_mode;
 use super::factor::compute_factor;
-use crate::feature_sched::get_factor_params;
+use crate::feature_sched::{get_factor_params, feat_exists, set_feat0, get_alpha_init};
 
 pub struct FeaturesAccountingStage<C> {
     // pub map_name: &'static str,
@@ -48,6 +49,10 @@ where
         _mgr: &mut EM,
     ) -> Result<(), Error> {
         // disable features factor then return directly
+        if get_feat_mode() == 0 {
+            return Ok(());
+        }
+
         if !features_enabled() {
             if let Some(cid_ref) = state.corpus().current() {
                 let cid = *cid_ref;
@@ -116,6 +121,8 @@ where
             };
             let feats = state.metadata_map().get::<FeaturesMapMeta>()
                 .expect("FeaturesMapMeta not in State").feats.as_slice();
+
+            set_feat0(*feats.get(0).unwrap_or(&0.0));
         
             meta.list.iter().fold(0.0, |acc, &i| acc + feats.get(i).copied().unwrap_or(0.0))
         };
@@ -148,20 +155,31 @@ where
     }
 
     fn should_restart(&mut self, _state: &mut S) -> Result<bool, Error> { 
+        // cold fuzzing forever when feat_mode==0 
+        if get_feat_mode() == 0 {
+            return Ok(false);
+        }
+        // if no features_map then cold fuzzing forever
+        if !feat_exists() {
+            return Ok(false);
+        }
+
         let start_time = unsafe { FUZZ_START.unwrap_or_else(Instant::now) }; // Use FUZZ_START or set current time if not initialized
         let elapsed = start_time.elapsed();
 
         // hours delay before enabling features (modify the duration as needed)
         let cold_start_duration = Duration::from_secs(12 * 60 * 60);
+        // let cold_start_duration = Duration::from_secs(30);
 
         // If elapsed time is greater than or equal to the cold start duration, enable the feature
         if !FEATURES_ACTIVE.load(Ordering::Relaxed) && elapsed >= cold_start_duration {
             // Log and enable the feature
             FEATURES_ACTIVE.store(true, Ordering::Relaxed);
             let mut params = get_factor_params();
-            params.alpha = 1.0;
+            let alpha_init_val = get_alpha_init();
+            params.alpha = if alpha_init_val.is_nan() { 1.0 } else { alpha_init_val };
             set_factor_params(params);
-            set_features_enabled(true);
+            recompute_features_enabled();
 
             return Ok(true); // Return true to trigger `perform`
         }
