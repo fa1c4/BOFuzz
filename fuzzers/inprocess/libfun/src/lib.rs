@@ -15,7 +15,6 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 use clap::{Arg, Command};
@@ -38,7 +37,7 @@ use libafl::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, StdWeightedScheduler,
     },
     stages::{
-        Stage, calibrate::CalibrationStage, StdMutationalStage, TracingStage, power::StdPowerMutationalStage,
+        calibrate::CalibrationStage, StdMutationalStage, TracingStage, power::StdPowerMutationalStage,
     },
     state::{HasCorpus, StdState},
     Error, HasMetadata,
@@ -58,26 +57,22 @@ use libafl_targets::{
 };
 #[cfg(unix)]
 use nix::unistd::dup;
-use std::time::Instant;
 
 // libfun mod
 mod feature_sched;
 use crate::feature_sched::{
     features_map::load_and_align_features_map,
-    FeaturesAccountingStage, FeaturesMapMeta, FactorParams, FeaturesMatrixMeta,
+    FeaturesAccountingStage, FeaturesMapMeta, FactorParams, FeaturesMatrixMeta, SancovIndexFeedback,
     get_features_enabled, set_fuzz_start, get_fuzz_start,
-    set_factor_params, get_factor_params,
-    SancovIndexFeedback,
-    set_feat_exists, get_feat_exists,
+    set_factor_params, set_feat_exists,
     set_explore_time, set_tpe_period,
-    set_tpe_satisfied, set_current_v,
+    set_tpe_satisfied, set_current_weight_vec,
+    set_feat_mode, set_alpha_init,
 };
+mod custom_monitor;
+use crate::custom_monitor::CustomMonitor;
 
-use libafl::schedulers::testcase_score::{get_feat_mode, set_feat_mode};
-use crate::feature_sched::{set_feat0, get_feat0};
-use crate::feature_sched::{set_alpha_init, get_alpha_init};
-
-use crate::feature_sched::{ TpeStage, TpeParams, get_tpe_satisfied, get_tpe_period };
+use crate::feature_sched::{ TpeStage, TpeParams, get_tpe_period };
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 extern "C" {
@@ -201,14 +196,14 @@ pub extern "C" fn libafl_main() {
                 .long("explore-time")
                 .value_parser(clap::value_parser!(u64))
                 .default_value("12")
-                .help("hours set for explore stage, default is 12 hours")
+                .help("explore time set for explore stage, default is 12 hours")
             )
         .arg(
             Arg::new("tpe-period")
                 .long("tpe-period")
                 .value_parser(clap::value_parser!(u64))
                 .default_value("10")
-                .help("minutes set for TPE learning period each iteration, default is 10 min")
+                .help("TPE period set for TPE learning period each iteration, default is 10 min")
             )
         .arg(Arg::new("remaining"))
         .try_get_matches()
@@ -290,8 +285,8 @@ pub extern "C" fn libafl_main() {
     let fun_args = FunArgs {
         factor_params: params,
         feat_mode: *res.get_one::<u8>("feat-mode").unwrap(),
-        explore_time_secs: *res.get_one::<u64>("explore-time").unwrap() * 60 * 60,
-        tpe_period_secs: *res.get_one::<u64>("tpe-period").unwrap() * 60,
+        explore_time_secs: *res.get_one::<u64>("explore-time").unwrap(),
+        tpe_period_secs: *res.get_one::<u64>("tpe-period").unwrap(),
     };
 
     fuzz(out_dir, crashes, &in_dir, tokens, &logfile, timeout, cli_features_path, fun_args)
@@ -333,7 +328,7 @@ fn fuzz(
     logfile: &PathBuf,
     timeout: Duration,
     cli_features_path: Option<PathBuf>,
-    mut fun_args: FunArgs,
+    fun_args: FunArgs,
 ) -> Result<(), Error> {
     let log = RefCell::new(OpenOptions::new().append(true).create(true).open(logfile)?);
 
@@ -346,7 +341,14 @@ fn fuzz(
     let file_null = File::open("/dev/null")?;
 
     // 'While the monitor are state, they are usually used in the broker - which is likely never restarted
-    let monitor = SimpleMonitor::new(|s| {
+    // let monitor = SimpleMonitor::new(|s| {
+    //     #[cfg(unix)]
+    //     writeln!(&mut stdout_cpy, "{s}").unwrap();
+    //     #[cfg(windows)]
+    //     println!("{s}");
+    //     writeln!(log.borrow_mut(), "{:?} {s}", current_time()).unwrap();
+    // });
+    let monitor = CustomMonitor::new(|s| {
         #[cfg(unix)]
         writeln!(&mut stdout_cpy, "{s}").unwrap();
         #[cfg(windows)]
@@ -394,43 +396,6 @@ fn fuzz(
         (obs, sancov_sites, cntrs_ptr)
     };
     let sancov_handle = sancov_observer.handle();
-    fn default_features_path() -> Option<PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
-        let stem = exe.file_stem()?.to_string_lossy();
-        Some(exe_dir.join(format!("{}_features_map.json", stem)))
-    }
-
-    // use /path_to/the_same_directory/{target_name}_features_map.json file as default file path
-    let chosen_path = if let Some(p) = cli_features_path { Some(p) } else { default_features_path() };
-    let chosen_path = chosen_path.and_then(|p| if p.exists() { Some(p) } else { None });
-
-    let mut pending_feats: Option<Vec<f64>> = None;
-    let mut pending_matrix: Option<std::collections::HashMap<String, Vec<f64>>> = None;
-    let mut has_feats = false;
-    let mut vcur: Vec<f64> = Vec::new();
-    let mut tpe_sat_flag = false;
-    if let Some(p) = chosen_path.as_ref() {
-        match load_and_align_features_map(p, sancov_sites) {
-            Ok((feats, matrix_opt, v0_opt, tpe_sat)) => {
-                eprintln!("[features] using features map: {}", p.display());
-                pending_feats = Some(feats);
-                pending_matrix = matrix_opt;
-                has_feats = true;
-                if let Some(v0) = v0_opt {
-                    vcur = v0; // only exists with matrix
-                }
-                tpe_sat_flag = tpe_sat;
-            }
-            Err(e) => {
-                eprintln!("[features] failed to load {}: {e}. Disabling features.", p.display());
-                has_feats = false;
-            }
-        }
-    } else {
-        eprintln!("[features] no features map provided/found. Disabling features.");
-        has_feats = false;
-    }
 
     // Create an observation channel to keep track of the execution time
     let time_observer = TimeObserver::new("time");
@@ -474,6 +439,38 @@ fn fuzz(
         .unwrap()
     });
 
+    fn default_features_path() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+        let stem = exe.file_stem()?.to_string_lossy();
+        Some(exe_dir.join(format!("{}_features_map.json", stem)))
+    }
+
+    // use /path_to/the_same_directory/{target_name}_features_map.json file as default file path
+    let chosen_path = if let Some(p) = cli_features_path { Some(p) } else { default_features_path() };
+    let chosen_path = chosen_path.and_then(|p| if p.exists() { Some(p) } else { None });
+
+    let mut pending_feats: Option<Vec<f64>> = None;
+    let mut pending_matrix: Option<std::collections::HashMap<String, Vec<f64>>> = None;
+    let mut has_feats = false;
+    if let Some(p) = chosen_path.as_ref() {
+        match load_and_align_features_map(&mut state, p, sancov_sites) {
+            Ok((feats, matrix_opt)) => {
+                eprintln!("[features] using features map: {}", p.display());
+                pending_feats = Some(feats);
+                pending_matrix = matrix_opt;
+                has_feats = true;
+            }
+            Err(e) => {
+                eprintln!("[features] failed to load {}: {e}. Disabling features.", p.display());
+                has_feats = false;
+            }
+        }
+    } else {
+        eprintln!("[features] no features map provided/found. Disabling features.");
+        has_feats = false;
+    }
+
     // Fuzz Start Time record
     set_fuzz_start(&mut state);
     eprintln!("[params] fuzz start time: {} s", get_fuzz_start(&state) / 1000);
@@ -487,15 +484,11 @@ fn fuzz(
         state.add_metadata(FeaturesMatrixMeta { matrix, sites: sancov_sites });
     }
     set_feat_exists(&mut state, has_feats);
-    set_tpe_satisfied(&mut state, tpe_sat_flag);
-    if tpe_sat_flag && !vcur.is_empty() {
-        set_current_v(&mut state, vcur);
-    }
 
     // setting funafl parameters
     set_alpha_init(&mut state, fun_args.factor_params.alpha);
 
-    set_feat_mode(fun_args.feat_mode);
+    set_feat_mode(&mut state, fun_args.feat_mode);
     eprintln!("[factor-params] feat_mode={}", fun_args.feat_mode);
 
     set_explore_time(&mut state, fun_args.explore_time_secs);
@@ -617,7 +610,7 @@ fn fuzz(
     };
 
     // build TPE stage（period from CLI -> get_tpe_period())
-    let mut tpe_stage = {
+    let tpe_stage = {
         let mut p = TpeParams::default();
         p.period = Duration::from_secs(get_tpe_period(&state));
         TpeStage::new(p)

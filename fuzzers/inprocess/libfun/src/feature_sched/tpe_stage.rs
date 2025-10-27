@@ -13,11 +13,10 @@ use super::tpe::{TpeOptimizer, TpeParams};
 use super::{
     get_factor_params, set_factor_params,
     features_map::{apply_v_to_features},
-    get_current_weight_vec, V_CANDIDATES,
 };
 use libafl_bolts::rands::StdRand;
 
-use crate::feature_sched::{get_features_enabled, get_tpe_satisfied};
+use crate::feature_sched::{get_features_enabled, get_tpe_satisfied, get_v_candidates, get_current_weight_vec};
 
 pub struct TpeStage {
     pub opt: TpeOptimizer,
@@ -43,20 +42,20 @@ where
         state: &mut S,
         _mgr: &mut EM,
     ) -> Result<(), Error> {
-        // init weight_vec = [alpha, v]
+        // init weight_vec = [alpha, w_1, ..., w_dim]
         {
             let params = get_factor_params(state);
-            let mut v = vec![params.alpha];
-            let cur = get_current_weight_vec(state);
-            if cur.is_empty() {
-                // use V_CANDIDATES[0] as default
-                let cand = V_CANDIDATES.read().unwrap();
-                if let Some(first) = cand.first() {
-                    v.extend_from_slice(&first[..]);
-                }
-            } else {
-                v.extend_from_slice(&cur[..]);
-            }
+            let cur9 = get_current_weight_vec(state);
+            let v = if cur9.is_empty() {
+                    get_v_candidates(state)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| {
+                        let mut t = vec![params.alpha];
+                        t.extend(std::iter::repeat(1.0/8f64.sqrt()).take(8));
+                        t
+                    })
+            } else { cur9 };
             self.opt.init_vec_if_empty(&v);
         }
 
@@ -69,17 +68,15 @@ where
         self.opt.observe(&last, reward);
 
         // generate new weight_vec
-        let new_vec = self.opt.suggest(&mut self.rng);
+        let new_vec = self.opt.suggest(state, &mut self.rng);
         self.opt.set_last_vec(&new_vec);
 
-        // apply [alpha + v]
+        // apply weight_vec
         if new_vec.len() >= 9 {
-            let mut params = get_factor_params(state);
-            params.alpha = new_vec[0].clamp(0.0, 1.0);
-            set_factor_params(state, params);
-
-            let v = &new_vec[1..9]; // 8 dim
-            apply_v_to_features(state, v)?;
+            let mut p = get_factor_params(state);
+            p.alpha = new_vec[0].clamp(0.0, 1.0);
+            set_factor_params(state, p);
+            apply_v_to_features(state, &new_vec[1..9])?;
         }
 
         // mark end of window
@@ -109,7 +106,7 @@ where
             } else { "[]".to_string() };
 
             let summary = format!(
-                "[TPE] reward=ΔCorpus={:.2}, trials={}, corpus={}, alpha={:.2}, \
+                "reward=ΔCorpus={:.2}, trials={}, corpus={}, alpha={:.2}, \
                 v_norm={:.2}, v8={}, bw={:.2}, gamma={:.2}, samples={}, period={:?}",
                 reward, trials_len, corpus_now, alpha,
                 v_norm, v_show, self.opt.params.bw, self.opt.params.gamma,

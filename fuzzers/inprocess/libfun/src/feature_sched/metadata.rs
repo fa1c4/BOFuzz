@@ -29,21 +29,20 @@ pub struct FeaturesMatrixMeta {
 
 #[derive(Serialize, Deserialize, SerdeAny, Clone, Debug)]
 pub struct FeatureGlobalsMeta {
-    pub features_active: bool,   // FEATURES_ACTIVE
-    pub feat_exists: bool,       // FEAT_EXISTS
-    pub tpe_satisfied: bool,     // TPE_SATISFIED
+    pub features_active: bool,       // FEATURES_ACTIVE
+    pub feat_exists: bool,           // FEAT_EXISTS
+    pub tpe_satisfied: bool,         // TPE_SATISFIED
 
-    pub feat_val0: f64,          // FEAT_VAL0
-    pub explore_time_secs: u64,  // EXPLORE_TIME
-    pub tpe_period_secs: u64,    // TPE_PERIOD
-    pub alpha_init: f64,         // ALPHA_INIT
+    pub feat_val0: f64,              // FEAT_VAL0
+    pub explore_time_secs: u64,      // EXPLORE_TIME
+    pub tpe_period_secs: u64,        // TPE_PERIOD
+    pub alpha_init: f64,             // ALPHA_INIT
 
     // params and vector
     pub factor_params: super::factor::FactorParams,
-    pub current_v: Vec<f64>,
-
-    // FUZZ_START: epoch ms
-    pub fuzz_start_epoch_ms: u64,
+    pub current_v: Vec<f64>,         // 9 dim vec: [alpha, w1..w8]
+    pub v_candidates: Vec<Vec<f64>>, // 9 dim candidates
+    pub fuzz_start_epoch_ms: u64,    // FUZZ_START: epoch ms
 }
 
 impl Default for FeatureGlobalsMeta {
@@ -60,6 +59,7 @@ impl Default for FeatureGlobalsMeta {
                 alpha: 1.0, beta: 0.6, gmin: 0.0, gmax: 3.0, use_tanh: false
             },
             current_v: Vec::new(),
+            v_candidates: Vec::new(),
             fuzz_start_epoch_ms: 0,
         }
     }

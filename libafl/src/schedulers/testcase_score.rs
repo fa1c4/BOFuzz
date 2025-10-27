@@ -16,23 +16,35 @@ use crate::{
 // for libfun metadata usage
 use serde::{Deserialize, Serialize};
 use libafl_bolts::SerdeAny;
-use core::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
 pub struct ExternalPerfMultMeta(pub f64);
 
+#[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
+pub struct FeatModeMeta(pub u8);
+
+pub fn get_feat_mode_from_state<S: HasMetadata>(state: &S) -> u8 {
+    state
+        .metadata_map()
+        .get::<FeatModeMeta>()
+        .map(|m| m.0)
+        .unwrap_or(0)
+}
+
+/*
 // global feat_mode: 0=off, 1=weight only, 2=power only, 3=both
 static FEAT_MODE: AtomicU8 = AtomicU8::new(0);
 
-/// set global feat_mode（0..=3）
+// set global feat_mode（0..=3）
 pub fn set_feat_mode(m: u8) {
     FEAT_MODE.store(m.min(3), Ordering::Relaxed);
 }
 
-/// get global feat_mode
+// get global feat_mode
 pub fn get_feat_mode() -> u8 {
     FEAT_MODE.load(Ordering::Relaxed)
 }
+*/
 
 /// Compute the favor factor of a [`Testcase`]. Higher is better.
 pub trait TestcaseScore<I, S> {
@@ -270,7 +282,7 @@ where
         }
 
         // [allow exceed upper bound] libfun features factor 
-        if matches!(get_feat_mode(), 2 | 3) {
+        if matches!(get_feat_mode_from_state(state), 2 | 3) {
             if let Some(mult) = entry.metadata_map().get::<ExternalPerfMultMeta>() {
                 let m = mult.0;
                 if m.is_finite() && (m - 1.0).abs() > 1e-12 && m > 0.0 {
@@ -367,7 +379,7 @@ where
         }
 
         // libfun features on weight 
-        if matches!(get_feat_mode(), 1 | 3) {
+        if matches!(get_feat_mode_from_state(state), 1 | 3) {
             if let Some(mult) = entry.metadata_map().get::<ExternalPerfMultMeta>() {
                 let m = mult.0;
                 if m.is_finite() && (m - 1.0).abs() > 1e-12 && m > 0.0 {

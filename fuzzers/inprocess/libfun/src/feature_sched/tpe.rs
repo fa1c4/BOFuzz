@@ -5,6 +5,7 @@ use libafl_bolts::{rands::{StdRand, Rand}, current_time};
 use core::num::NonZeroUsize;
 use libafl::common::HasMetadata;
 use crate::feature_sched::TpeHistoryMeta;
+use crate::feature_sched::{get_v_candidates, push_v_candidate, vecn_eq};
 
 #[derive(Clone, Debug)]
 pub struct TpeParams {
@@ -24,7 +25,6 @@ impl Default for TpeParams {
 pub struct Trial {
     pub vec: Vec<f64>,  // [alpha, v1..v8]
     pub reward: f64,
-    pub ts: Instant,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -33,6 +33,9 @@ pub struct TpeState {
     pub last_vec: Vec<f64>,         // last applying vector
     pub last_check: Option<Instant>,
     pub last_corpus: Option<usize>, // last corpus.count of window
+    pub no_new_counter: usize,      
+    pub lock_best: bool,            // convergence flag
+    pub best_fixed: Vec<f64>,       // best vec
 }
 
 fn now_epoch_ms() -> u64 {
@@ -68,7 +71,7 @@ impl TpeOptimizer {
 
     pub fn observe(&self, vec: &[f64], reward: f64) {
         let mut s = self.state.write().unwrap();
-        s.trials.push(Trial { vec: vec.to_vec(), reward, ts: Instant::now() });
+        s.trials.push(Trial { vec: vec.to_vec(), reward });
 
         const MAX_TRIALS: usize = 1024;
         if s.trials.len() > MAX_TRIALS {
@@ -77,46 +80,79 @@ impl TpeOptimizer {
         }
     }
 
-    pub fn suggest(&self, rng: &mut StdRand) -> Vec<f64> {
+    pub fn suggest<S: HasMetadata>(&self, state: &mut S, rng: &mut StdRand) -> Vec<f64> {
+        // 1) if reached covergence then return best_v
+        {
+            let s = self.state.read().unwrap();
+            if s.lock_best && !s.best_fixed.is_empty() {
+                return s.best_fixed.clone();
+            }
+        }
+
+        // 2) warmup: apply weight_vec in candidates without reward
+        if let Some(v) = self.next_untried_from_pool(state) {
+            return v;
+        }
+
+        // 3) TPE optimizing: fetch l/g best vec then KDE to get new vec
+        let added = self.refine_best_to_candidates(state, rng, 4);
+        if added > 0 {
+            if let Some(v) = self.next_untried_from_pool(state) {
+                return v;
+            }
+        }
+
+        // 4) no new candidates up to 3 times, then lock best in history 
+        {
+            let mut s = self.state.write().unwrap();
+            if added == 0 {
+                s.no_new_counter += 1;
+                if s.no_new_counter >= 3 {
+                    if let Some(best) = self.best_by_lg() {
+                        s.best_fixed = best.clone();
+                        s.lock_best = true;
+                        s.no_new_counter = 0;
+                        return s.best_fixed.clone();
+                    }
+                }
+            } else {
+                s.no_new_counter = 0;
+            }
+        }
+
+        // 5) if samples are too few, use disturbance to generate new vecs; 
         let s = self.state.read().unwrap();
-        if s.trials.len() < 10 {
-            // starting lack of samples then use disturbance
+        if s.trials.len() < 5 {
             return jitter_and_project(&s.last_vec, rng);
         }
+        drop(s);
 
-        // 1) calculate quantile threshold
-        let n = s.trials.len();
-        let mut rewards: Vec<f64> = s.trials.iter().map(|t| t.reward).collect();
-        rewards.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let k = ( (n as f64 * self.params.gamma).ceil() as usize ).clamp(1, n);
-        let y_star = rewards[n - k]; 
+        // 6) otherwise sampling as KDE
+        let (lset, gset, _y_star) = match self.split_l_g() {
+            Some(x) => x,
+            None => {
+                let s = self.state.read().unwrap();
+                return jitter_and_project(&s.last_vec, rng);
+            }
+        };
 
-        // 2) construct L / G
-        let mut L: Vec<&Trial> = Vec::new();
-        let mut G: Vec<&Trial> = Vec::new();
-        for t in &s.trials {
-            if t.reward >= y_star { L.push(t); } else { G.push(t); }
-        }
-        // make sure is not empty
-        if L.is_empty() || G.is_empty() {
-            return jitter_and_project(&s.last_vec, rng);
-        }
-
-        // 3) sample candidates from L's KDE
         let mut best = None;
         for _ in 0..self.params.samples {
-            let cand = sample_from_kde_reflect(&L, self.params.bw, rng);
-            let l = kde_pdf_reflect(&L, &cand, self.params.bw);
-            let g = kde_pdf_reflect(&G, &cand, self.params.bw);
+            let cand = sample_from_kde_reflect(&lset, self.params.bw, rng);
+            let l = kde_pdf_reflect(&lset, &cand, self.params.bw);
+            let g = kde_pdf_reflect(&gset, &cand, self.params.bw);
             let score = if g > 0.0 { l / g } else { f64::INFINITY };
-
             match best {
                 None => best = Some((score, cand)),
                 Some((bs, _)) if score > bs => best = Some((score, cand)),
                 _ => {}
             }
         }
-        best.map(|(_, v)| project_vec(v)).unwrap_or_else(|| jitter_and_project(&s.last_vec, rng))
+        best.map(|(_, v)| project_vec(v))
+            .unwrap_or_else(|| {
+                let s = self.state.read().unwrap();
+                jitter_and_project(&s.last_vec, rng)
+            })
     }
 
     // tpe window is over
@@ -180,12 +216,91 @@ impl TpeOptimizer {
             s.trials.clear();
             s.trials.reserve(meta.trials.len());
             for (v, r, _ts) in &meta.trials {
-                s.trials.push(Trial { vec: v.clone(), reward: *r, ts: Instant::now() });
+                s.trials.push(Trial { vec: v.clone(), reward: *r });
             }
             s.last_vec = meta.last_vec.clone();
             s.last_corpus = meta.last_corpus;
             s.last_check = meta.last_check_ms.map(|_| Instant::now());
         }
+    }
+
+    // traverse all init candidates weight_vec
+    pub fn next_untried_from_pool<S: HasMetadata>(&self, state: &S) -> Option<Vec<f64>> {
+        let pool = get_v_candidates(state);
+        let s = self.state.read().unwrap();
+        'outer: for v9 in pool.iter() {
+            for t in &s.trials {
+                // same vec in history then continue
+                if t.vec.len() == v9.len() && vecn_eq(&t.vec, v9, 1e-3) {
+                    continue 'outer;
+                }
+            }
+            return Some(project_vec(v9.clone()));
+        }
+        None
+    }
+
+    // calculate L/G sets and threshold according to trials, empty then return None
+    pub fn split_l_g<'a>(&'a self) -> Option<(Vec<Trial>, Vec<Trial>, f64)> {
+        let s = self.state.read().unwrap();
+        if s.trials.len() < 5 { return None; }
+
+        let mut trials = s.trials.clone();
+        drop(s);
+
+        trials.sort_by(|a, b| a.reward.partial_cmp(&b.reward).unwrap());
+        let n = trials.len();
+        let k = ((n as f64 * self.params.gamma).ceil() as usize).clamp(1, n);
+        let y_star = trials[n - k].reward;
+
+        let mut lset = Vec::new();
+        let mut gset = Vec::new();
+        for t in trials.into_iter() {
+            if t.reward >= y_star { lset.push(t); } else { gset.push(t); }
+        }
+        if lset.is_empty() || gset.is_empty() { return None; }
+        Some((lset, gset, y_star))
+    }
+
+    // calculate v's l/g
+    pub fn l_over_g(&self, v: &[f64]) -> Option<f64> {
+        let (lset, gset, _) = self.split_l_g()?;
+        let l = kde_pdf_reflect(&lset, v, self.params.bw);
+        let g = kde_pdf_reflect(&gset, v, self.params.bw);
+        if g > 0.0 { Some(l / g) } else { Some(f64::INFINITY) }
+    }
+
+    // search for best v in history
+    pub fn best_by_lg(&self) -> Option<Vec<f64>> {
+        let (lset, gset, _) = self.split_l_g()?;
+        let s = self.state.read().unwrap();
+        let mut best: Option<(f64, Vec<f64>)> = None;
+        for t in &s.trials {
+            if t.vec.len() < 9 { continue; }
+            let l = kde_pdf_reflect(&lset, &t.vec, self.params.bw);
+            let g = kde_pdf_reflect(&gset, &t.vec, self.params.bw);
+            let score = if g > 0.0 { l / g } else { f64::INFINITY };
+            match best {
+                None => best = Some((score, t.vec.clone())),
+                Some((bs, _)) if score > bs => best = Some((score, t.vec.clone())),
+                _ => {}
+            }
+        }
+        best.map(|(_, v)| v)
+    }
+
+    // KDE sample from best vec, then put new vecs into V_CANDIDATES (not redundant), return number of new vecs
+    pub fn refine_best_to_candidates<S: HasMetadata>(
+        &self, state: &mut S, rng: &mut StdRand, k: usize
+    ) -> usize {
+        let (lset, _gset, _) = match self.split_l_g() { Some(x) => x, None => return 0 };
+        let mut added = 0usize;
+        for _ in 0..k {
+            let cand = project_vec(sample_from_kde_reflect(&lset, self.params.bw, rng));
+            push_v_candidate(state, cand);
+            added += 1;
+        }
+        added
     }
 }
 
@@ -203,11 +318,11 @@ fn reflect_pdf_1d(x: f64, mu: f64, h: f64) -> f64 {
     (gaussian_pdf(z1) + gaussian_pdf(z2) + gaussian_pdf(z3)) / h
 }
 
-fn kde_pdf_reflect(set: &[&Trial], x: &[f64], h: f64) -> f64 {
+fn kde_pdf_reflect(set: &[Trial], x: &[f64], h: f64) -> f64 {
     let d = x.len();
     let n = set.len() as f64;
     let mut s = 0.0;
-    for t in set {
+    for t in set.iter() {
         let mut p = 1.0;
         for j in 0..d {
             p *= reflect_pdf_1d(x[j], t.vec[j], h);
@@ -217,7 +332,7 @@ fn kde_pdf_reflect(set: &[&Trial], x: &[f64], h: f64) -> f64 {
     s / n
 }
 
-fn sample_from_kde_reflect(set: &[&Trial], h: f64, rng: &mut StdRand) -> Vec<f64> {
+fn sample_from_kde_reflect(set: &[Trial], h: f64, rng: &mut StdRand) -> Vec<f64> {
     let d = set[0].vec.len();
     let base = set[rng.below(NonZeroUsize::new(set.len()).unwrap())].vec.clone();
     let mut out = vec![0.0; d];

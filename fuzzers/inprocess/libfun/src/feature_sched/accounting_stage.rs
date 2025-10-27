@@ -1,11 +1,7 @@
 /*
 feature_sched/accounting_stage.rs: calculate the features factor and set to metadata
 */
-use std::time::{Instant, Duration};
-use std::sync::atomic::Ordering;
-use std::path::Path;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::time::Duration;
 use libafl::{
     stages::Stage, executors::Executor, events::{EventFirer, Event},
     observers::{ObserversTuple, MapObserver},
@@ -22,12 +18,13 @@ use super::metadata::{PathWeightMeta, GlobalStatsMeta, FeaturesMapMeta};
 use super::stats::WeightStats;
 
 use libafl::schedulers::testcase_score::ExternalPerfMultMeta;
-use libafl::schedulers::testcase_score::get_feat_mode;
+use crate::feature_sched::get_feat_mode;
 use super::factor::compute_factor;
 
-use crate::feature_sched::{V_CANDIDATES, get_features_enabled, set_factor_params, SancovIndexesMetadata};
-use crate::feature_sched::{get_factor_params, get_feat_exists, set_feat0, get_feat0, get_alpha_init, get_explore_time};
-use crate::feature_sched::{get_features_active, set_features_active, get_fuzz_start, get_current_weight_vec};
+use crate::feature_sched::SancovIndexesMetadata;
+use crate::feature_sched::{get_features_enabled, set_factor_params, get_v_candidates, get_factor_params, 
+    get_feat_exists, set_feat0, get_feat0, get_alpha_init, get_explore_time, 
+    get_features_active, set_features_active, get_fuzz_start, get_current_weight_vec};
 
 pub struct FeaturesAccountingStage<C> {
     // pub map_name: &'static str,
@@ -167,17 +164,17 @@ where
             let enabled = get_features_enabled(state);
             let active  = get_features_active(state);
             let feat_exists = get_feat_exists(state);
-            let feat_mode = get_feat_mode();
+            let feat_mode = get_feat_mode(state);
 
             let params = get_factor_params(state);
             let v_now = get_current_weight_vec(state);
-            let cand_cnt = V_CANDIDATES.read().unwrap().len();
+            let cand_cnt = get_v_candidates(state).len();
             let v_str = fmt_vec_short(&v_now, 8);
 
             let summary = format!(
-                "[Features] enabled={}, active={}, feat_mode={}, feat_exists={}, \
+                "enabled={}, active={}, feat_mode={}, feat_exists={}, \
                 alpha={:.2}, beta={:.2}, gmin={:.2}, gmax={:.2}, use_tanh={}, \
-                v_candidates={}, current_v={}, feat0={:.3}, path_w={:.3}, factor={:.3}",
+                v_candidates_len={}, current_v={}, feat0={:.3}, path_w={:.3}, factor={:.3}",
                 enabled, active, feat_mode, feat_exists,
                 params.alpha, params.beta, params.gmin, params.gmax, params.use_tanh,
                 cand_cnt, v_str, get_feat0(state), w, feat_factor
@@ -198,7 +195,7 @@ where
 
     fn should_restart(&mut self, _state: &mut S) -> Result<bool, Error> { 
         // cold fuzzing forever when feat_mode==0 
-        if get_feat_mode() == 0 {
+        if get_feat_mode(_state) == 0 {
             return Ok(false);
         }
         // if no features_map then cold fuzzing forever

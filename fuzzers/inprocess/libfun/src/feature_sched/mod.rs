@@ -14,8 +14,6 @@ pub use accounting_stage::FeaturesAccountingStage;
 pub use metadata::{FeaturesMapMeta, SancovIndexesMetadata};
 pub use sancov_index_feedback::SancovIndexFeedback;
 
-use std::sync::{RwLock, atomic::{AtomicU64, AtomicBool, Ordering}};
-use std::time::Instant;
 use libafl_bolts::current_time;
 
 pub mod tpe;
@@ -25,17 +23,18 @@ pub use tpe_stage::TpeStage;
 
 pub use metadata::{FeaturesMatrixMeta, TpeHistoryMeta, FeatureGlobalsMeta, FactorParamsMeta};
 
-// TPE weight vector candidates
-pub use crate::feature_sched::features_map::{ V_CANDIDATES, CURRENT_V };
-
 use libafl::common::HasMetadata;
-use libafl::schedulers::testcase_score::get_feat_mode;
+use libafl::schedulers::testcase_score::FeatModeMeta;
 
 fn globals_mut<S: HasMetadata>(state: &mut S) -> &mut FeatureGlobalsMeta {
     state.metadata_map_mut().get_or_insert_with::<FeatureGlobalsMeta>(Default::default)
 }
 fn globals<S: HasMetadata>(state: &S) -> FeatureGlobalsMeta {
     state.metadata_map().get::<FeatureGlobalsMeta>().cloned().unwrap_or_default()
+}
+
+pub fn vecn_eq(a: &[f64], b: &[f64], eps: f64) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= eps)
 }
 
 // getters
@@ -52,7 +51,19 @@ pub fn get_fuzz_start<S: HasMetadata>(state: &S) -> u64 { globals(state).fuzz_st
 
 // calculate features_enabled instantly
 pub fn get_features_enabled<S: HasMetadata>(state: &S) -> bool {
-    get_features_active(state) && get_feat_exists(state) && get_feat_mode() != 0
+    get_features_active(state) && get_feat_exists(state) && get_feat_mode(state) != 0
+}
+
+pub fn get_v_candidates<S: HasMetadata>(state: &S) -> Vec<Vec<f64>> {
+    globals(state).v_candidates
+}
+
+pub fn get_feat_mode<S: HasMetadata>(state: &S) -> u8 {
+    state
+        .metadata_map()
+        .get::<FeatModeMeta>()
+        .map(|m| m.0)
+        .unwrap_or(0)
 }
 
 // setters
@@ -84,10 +95,6 @@ pub fn set_alpha_init<S: HasMetadata>(state: &mut S, v: f64) {
     globals_mut(state).alpha_init = v;
 }
 
-pub fn set_current_v<S: HasMetadata>(state: &mut S, v: Vec<f64>) {
-    globals_mut(state).current_v = v.clone();
-}
-
 pub fn set_fuzz_start<S: HasMetadata>(state: &mut S) {
     globals_mut(state).fuzz_start_epoch_ms = current_time().as_millis() as u64;
 }
@@ -97,31 +104,25 @@ pub fn set_factor_params<S: HasMetadata>(state: &mut S, p: FactorParams) {
     state.add_metadata(FactorParamsMeta { params: p.clone() });
 }
 
+pub fn push_v_candidate<S: HasMetadata>(state: &mut S, v: Vec<f64>) {
+    let g = globals_mut(state);
+    if !g.v_candidates.iter().any(|u| vecn_eq(u, &v, 1e-3)) {
+        g.v_candidates.push(v);
+    }
+}
+pub fn replace_v_candidates<S: HasMetadata>(state: &mut S, v: Vec<Vec<f64>>) {
+    globals_mut(state).v_candidates = v;
+}
 
-/* -- static global variants --
-// set features active flag
-pub static FEATURES_ACTIVE: AtomicBool = AtomicBool::new(false);
-// whether features_map exists/loaded successfully
-static FEAT_EXISTS: AtomicBool = AtomicBool::new(false);
-// whether TPE is available only when input is attrs*dim matrix
-static TPE_SATISFIED: AtomicBool = AtomicBool::new(false);
+pub fn set_current_weight_vec<S: HasMetadata>(state: &mut S, v: Vec<f64>) {
+    globals_mut(state).current_v = v;
+}
 
-// startup time record
-pub static mut FUZZ_START: Option<Instant> = None;
-
-static FEAT_VAL0: AtomicU64 = AtomicU64::new(0);
-
-// default EXPLORE TIME is 12 hours
-static EXPLORE_TIME: AtomicU64 = AtomicU64::new(12 * 60 * 60);
-
-// default TPE study window period is 10 minutes
-static TPE_PERIOD: AtomicU64 = AtomicU64::new(10 * 60);
-
-static ALPHA_INIT: AtomicU64 = AtomicU64::new(f64::NAN.to_bits());
-
-// factor global params store and get
-// Use RwLock to allow for mutable access to params
-pub static FACTOR_PARAMS: RwLock<FactorParams> = RwLock::new(FactorParams { 
-    alpha: 1.0, beta: 0.6, gmin: 0.0, gmax: 3.0, use_tanh: false 
-});
-*/
+pub fn set_feat_mode<S: HasMetadata>(state: &mut S, m: u8) {
+    let m = m.min(3);
+    if let Some(meta) = state.metadata_map_mut().get_mut::<FeatModeMeta>() {
+        meta.0 = m;
+    } else {
+        state.add_metadata(FeatModeMeta(m));
+    }
+}

@@ -2,7 +2,9 @@
 feature_sched/features_map.rs: load and parse the features_map.json data
 */
 use serde::{Serialize, Deserialize};
-use crate::feature_sched::{metadata::{FeaturesMapMeta, FeaturesMatrixMeta}, set_tpe_satisfied, set_current_v};
+use crate::feature_sched::metadata::{FeaturesMapMeta, FeaturesMatrixMeta};
+use crate::feature_sched::{replace_v_candidates, get_alpha_init, set_current_weight_vec, 
+        get_v_candidates, set_tpe_satisfied, get_factor_params, get_current_weight_vec};
 use std::{
     collections::HashMap,
     fs::File,
@@ -29,26 +31,63 @@ enum FeatsJson {
 
 const ATTR_ORDER: [&str; 8] = ["imme", "strc", "mem", "arith", "indeg", "offsp", "btw", "depth"];
 
-pub static V_CANDIDATES: Lazy<RwLock<Vec<Vec<f64>>>> = Lazy::new(|| RwLock::new(Vec::new()));
-pub static CURRENT_V: Lazy<RwLock<Vec<f64>>> = Lazy::new(|| RwLock::new(Vec::new()));
+fn ensure_v_candidates_for<S: HasMetadata>(state: &mut S, features_map_path: &Path) {
+    if !get_v_candidates(state).is_empty() { return; }
 
-fn ensure_v_candidates_for(features_map_path: &Path) {
-    let mut guard = V_CANDIDATES.write().unwrap();
-    if !guard.is_empty() {
-        return;
-    }
-    let d = ATTR_ORDER.len();
-
-    if let Some((dir, target)) = derive_dir_and_target(features_map_path) {
-        let cand_path = dir.join(format!("{}_v_candidates.json", target));
-        eprintln!("Reading v candidates file: {}", cand_path.display());
-        if let Ok(cands) = load_candidates_from(&cand_path, d) {
-            *guard = cands;
-            return;
+    let dims = ATTR_ORDER.len(); // default as 8
+    let cands8: Vec<Vec<f64>> = match derive_dir_and_target(features_map_path) {
+        Some((dir, tgt)) => {
+            let cand_path = dir.join(format!("{}_v_candidates.json", tgt));
+            match load_candidates_from(&cand_path, dims) {
+                Ok(v) if !v.is_empty() => {
+                    eprintln!("Reading v candidates file: {}", cand_path.display());
+                    v
+                }
+                _ => {
+                    eprintln!(
+                        "No v-candidates file provided or empty ({}), using defaults.",
+                        cand_path.display()
+                    );
+                    default_candidates(dims)
+                }
+            }
         }
-    }
+        None => {
+            eprintln!(
+                "Cannot derive v-candidates path from {}, using defaults.",
+                features_map_path.display()
+            );
+            default_candidates(dims)
+        }
+    };
 
-    *guard = default_candidates(d);
+    // read alpha init
+    let alpha0 = get_alpha_init(state);
+    let alpha = if alpha0.is_finite() { alpha0 } else { 0.5 }.clamp(0.0, 1.0);
+    let cands9: Vec<Vec<f64>> = cands8
+        .into_iter()
+        .map(|v8| {
+            let mut v = Vec::with_capacity(1 + v8.len());
+            v.push(alpha);
+            v.extend(v8);
+            v
+        })
+        .collect();
+
+    replace_v_candidates(state, cands9);
+
+    let v0_9 = get_v_candidates(state)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            let mut v = vec![alpha];
+            v.extend(uniform_vec(8));
+            v
+        });
+
+    if get_current_weight_vec(state).is_empty() {
+        set_current_weight_vec(state, v0_9);
+    }
 }
 
 fn load_candidates_from(path: &Path, d: usize) -> std::io::Result<Vec<Vec<f64>>> {
@@ -114,43 +153,47 @@ fn derive_dir_and_target(p: &Path) -> Option<(PathBuf, String)> {
     }
 }
 
-pub fn load_and_align_features_map(
-    path: &Path, sites: usize,
+pub fn load_and_align_features_map<S: HasMetadata>(
+    state: &mut S,
+    path: &Path, 
+    sites: usize,
 ) -> std::io::Result<(
     Vec<f64>, 
     Option<std::collections::HashMap<String, Vec<f64>>>,
-    Option<Vec<f64>>,
-    bool, 
 )> {
-    ensure_v_candidates_for(path);
+    ensure_v_candidates_for(state, path);
 
     let mut f = File::open(path)?;
     let mut s = String::new();
     f.read_to_string(&mut s)?;
 
-    let v0: Vec<f64> = {
-        let g = V_CANDIDATES.read().unwrap();
-        if let Some(first) = g.first() {
-            first.clone()
-        } else {
-            let d = ATTR_ORDER.len();
-            vec![1.0 / (d as f64).sqrt(); d]
-        }
-    };
+    let v0_8: Vec<f64> = get_v_candidates(state)
+        .first()
+        .map(|v9| v9[1..].to_vec()) // get rid of alpha
+        .unwrap_or_else(|| vec![1.0 / (ATTR_ORDER.len() as f64).sqrt(); ATTR_ORDER.len()]);
     
-    let (feats_raw, matrix_opt, v0_opt, tpe_sat) =
+    let (feats_raw, matrix_opt, tpe_sat) =
         match serde_json::from_str::<FeatsJson>(&s).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("json parse err: {e}"))
         })? {
-            FeatsJson::Raw(feat) => (feat, None, None, false),
-            FeatsJson::Obj { features } => (features, None, None, false),
+            FeatsJson::Raw(feat) => (feat, None, false),
+            FeatsJson::Obj { features } => (features, None, false),
             FeatsJson::Dict(map) => {
-                let feats = combine_feature_matrix_to_weights(map.clone(), &v0);
-                (feats, Some(map), Some(v0), true)
+                let feats = combine_feature_matrix_to_weights(map.clone(), &v0_8);
+                (feats, Some(map), true)
             }
         };
 
-    Ok((align(feats_raw, sites), matrix_opt, v0_opt, tpe_sat))
+    set_tpe_satisfied(state, tpe_sat);
+    if tpe_sat {
+        let alpha = get_factor_params(state).alpha;
+        let mut v9 = Vec::with_capacity(1 + v0_8.len());
+        v9.push(alpha.clamp(0.0, 1.0));
+        v9.extend_from_slice(&v0_8);
+        set_current_weight_vec(state, v9);
+    }
+
+    Ok((align(feats_raw, sites), matrix_opt))
 }
 
 fn align(mut v: Vec<f64>, sites: usize) -> Vec<f64> {
@@ -250,7 +293,13 @@ pub fn apply_v_to_features<S: HasMetadata>(state: &mut S, v: &[f64]) -> Result<(
     }
 
     // update v
-    set_current_v(state, v.to_vec());
+    if !v.is_empty() {
+        let alpha = get_factor_params(state).alpha; // 或 get_alpha_init(&state)
+        let mut v9 = Vec::with_capacity(1 + v.len());
+        v9.push(alpha.clamp(0.0, 1.0));
+        v9.extend(v);
+        set_current_weight_vec(state, v9);
+    }
     
     Ok(())
 }
