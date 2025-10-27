@@ -1,12 +1,13 @@
 /*
 feature_sched/factor.rs: calculate the features factor
 */
+use serde::{Serialize, Deserialize};
 use super::metadata::{GlobalStatsMeta, PathWeightMeta};
 // use libafl::state::HasMetadata;
 use libafl::common::HasMetadata; 
-use crate::feature_sched::features_enabled;
+use crate::feature_sched::get_features_enabled;
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FactorParams {
     pub alpha: f64, // 0.0 ~ 1.0
     pub beta: f64,  // slope of exp/tanh: 0.4 ~ 0.8
@@ -24,7 +25,7 @@ impl Default for FactorParams {
 /// read testcase's PathWeight and global mean/variance, get the factor
 pub fn compute_factor<S: HasMetadata>(params: &FactorParams, state: &S, entry: &impl HasMetadata) -> f64 {
     // disable features factor then return 1.0
-    if !features_enabled() {
+    if !get_features_enabled(state) {
         return 1.0;
     }
 

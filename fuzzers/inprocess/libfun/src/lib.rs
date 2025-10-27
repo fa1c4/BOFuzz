@@ -38,7 +38,7 @@ use libafl::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, StdWeightedScheduler,
     },
     stages::{
-        calibrate::CalibrationStage, StdMutationalStage, TracingStage, power::StdPowerMutationalStage,
+        Stage, calibrate::CalibrationStage, StdMutationalStage, TracingStage, power::StdPowerMutationalStage,
     },
     state::{HasCorpus, StdState},
     Error, HasMetadata,
@@ -58,24 +58,26 @@ use libafl_targets::{
 };
 #[cfg(unix)]
 use nix::unistd::dup;
-use crate::feature_sched::{FEATURES_ACTIVE, FUZZ_START};
 use std::time::Instant;
 
 // libfun mod
 mod feature_sched;
 use crate::feature_sched::{
     features_map::load_and_align_features_map,
-    FeaturesAccountingStage, FeaturesMapMeta, FactorParams,
-    recompute_features_enabled, features_enabled, 
+    FeaturesAccountingStage, FeaturesMapMeta, FactorParams, FeaturesMatrixMeta,
+    get_features_enabled, set_fuzz_start, get_fuzz_start,
     set_factor_params, get_factor_params,
     SancovIndexFeedback,
-    set_feat_exists, feat_exists,
-    V_CANDIDATES, get_current_weight_vec,
+    set_feat_exists, get_feat_exists,
+    set_explore_time, set_tpe_period,
+    set_tpe_satisfied, set_current_v,
 };
 
 use libafl::schedulers::testcase_score::{get_feat_mode, set_feat_mode};
 use crate::feature_sched::{set_feat0, get_feat0};
 use crate::feature_sched::{set_alpha_init, get_alpha_init};
+
+use crate::feature_sched::{ TpeStage, TpeParams, get_tpe_satisfied, get_tpe_period };
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 extern "C" {
@@ -86,6 +88,15 @@ extern "C" {
     // pc-table
     static __start___sancov_pcs: usize;
     static __stop___sancov_pcs: usize;
+}
+
+// feature/tpe parameters
+#[derive(Clone, Debug)]
+struct FunArgs {
+    factor_params: FactorParams,
+    feat_mode: u8,
+    explore_time_secs: u64,
+    tpe_period_secs: u64,
 }
 
 // format vector printing
@@ -185,6 +196,20 @@ pub extern "C" fn libafl_main() {
                 .default_value("0")
                 .help("0: off, 1: weight only, 2: power only, 3: both")
             )
+        .arg(
+            Arg::new("explore-time")
+                .long("explore-time")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("12")
+                .help("hours set for explore stage, default is 12 hours")
+            )
+        .arg(
+            Arg::new("tpe-period")
+                .long("tpe-period")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("10")
+                .help("minutes set for TPE learning period each iteration, default is 10 min")
+            )
         .arg(Arg::new("remaining"))
         .try_get_matches()
     {
@@ -262,13 +287,14 @@ pub extern "C" fn libafl_main() {
         use_tanh: res.get_flag("tanh"),
     };
 
-    set_alpha_init(params.alpha);
+    let fun_args = FunArgs {
+        factor_params: params,
+        feat_mode: *res.get_one::<u8>("feat-mode").unwrap(),
+        explore_time_secs: *res.get_one::<u64>("explore-time").unwrap() * 60 * 60,
+        tpe_period_secs: *res.get_one::<u64>("tpe-period").unwrap() * 60,
+    };
 
-    let feat_mode: u8 = *res.get_one::<u8>("feat-mode").unwrap();
-    set_feat_mode(feat_mode);
-    eprintln!("[params] feat_mode={}", feat_mode);
-
-    fuzz(out_dir, crashes, &in_dir, tokens, &logfile, timeout, cli_features_path, params)
+    fuzz(out_dir, crashes, &in_dir, tokens, &logfile, timeout, cli_features_path, fun_args)
         .expect("An error occurred while fuzzing");
 }
 
@@ -307,15 +333,9 @@ fn fuzz(
     logfile: &PathBuf,
     timeout: Duration,
     cli_features_path: Option<PathBuf>,
-    mut params: FactorParams,
+    mut fun_args: FunArgs,
 ) -> Result<(), Error> {
     let log = RefCell::new(OpenOptions::new().append(true).create(true).open(logfile)?);
-
-    // record startup time
-    unsafe { 
-        FUZZ_START = Some(Instant::now()); 
-        eprintln!("[features] FUZZ_START: {:?}", FUZZ_START);
-    }
 
     #[cfg(unix)]
     let mut stdout_cpy = unsafe {
@@ -332,29 +352,6 @@ fn fuzz(
         #[cfg(windows)]
         println!("{s}");
         writeln!(log.borrow_mut(), "{:?} {s}", current_time()).unwrap();
-        
-        let features_status = if FEATURES_ACTIVE.load(Ordering::Relaxed) { "enabled" } else { "disabled" };
-
-        let params = get_factor_params();
-
-        let (cand_cnt, cur_v_str) = {
-            let cnt = V_CANDIDATES.read().unwrap().len();
-            let cur = get_current_weight_vec();
-            (cnt, fmt_vec_short(&cur, 8))
-        };
-
-        writeln!(
-            log.borrow_mut(),
-            "[Features Status] enabled={}, active={}, feat_mode={}, feat_exists={}, alpha={:.2}, beta={:.2}, gmin:{:.2}, gmax:{:.2}, use_tanh:{}, v_candidates:{}, current_v:{}, features_map[0]:{}",
-            features_enabled(),
-            features_status,
-            get_feat_mode(),
-            feat_exists(),
-            params.alpha, params.beta, params.gmin, params.gmax, params.use_tanh,
-            cand_cnt,
-            cur_v_str,
-            get_feat0(),
-        ).unwrap();
     });
 
     // We need a shared map to store our state before a crash.
@@ -409,21 +406,30 @@ fn fuzz(
     let chosen_path = chosen_path.and_then(|p| if p.exists() { Some(p) } else { None });
 
     let mut pending_feats: Option<Vec<f64>> = None;
+    let mut pending_matrix: Option<std::collections::HashMap<String, Vec<f64>>> = None;
+    let mut has_feats = false;
+    let mut vcur: Vec<f64> = Vec::new();
+    let mut tpe_sat_flag = false;
     if let Some(p) = chosen_path.as_ref() {
         match load_and_align_features_map(p, sancov_sites) {
-            Ok(v) => {
+            Ok((feats, matrix_opt, v0_opt, tpe_sat)) => {
                 eprintln!("[features] using features map: {}", p.display());
-                pending_feats = Some(v);
-                set_feat_exists(true);
+                pending_feats = Some(feats);
+                pending_matrix = matrix_opt;
+                has_feats = true;
+                if let Some(v0) = v0_opt {
+                    vcur = v0; // only exists with matrix
+                }
+                tpe_sat_flag = tpe_sat;
             }
             Err(e) => {
                 eprintln!("[features] failed to load {}: {e}. Disabling features.", p.display());
-                set_feat_exists(false);
+                has_feats = false;
             }
         }
     } else {
         eprintln!("[features] no features map provided/found. Disabling features.");
-        set_feat_exists(false);
+        has_feats = false;
     }
 
     // Create an observation channel to keep track of the execution time
@@ -468,28 +474,45 @@ fn fuzz(
         .unwrap()
     });
 
+    // Fuzz Start Time record
+    set_fuzz_start(&mut state);
+    eprintln!("[params] fuzz start time: {} s", get_fuzz_start(&state) / 1000);
+
     // add features_map to metadata
     if let Some(feats) = pending_feats.take() {
         state.add_metadata(FeaturesMapMeta { feats });
     }
-
-    // set startup mode as default
-    eprintln!("Startup with default mode, disable features heuristic method...");
-    recompute_features_enabled();
-
-    // when disable feature factor then set alpha = 0.0
-    if !features_enabled() {
-        params.alpha = 0.0;
+    // add source features_map matrix to metadata
+    if let Some(matrix) = pending_matrix.take() {
+        state.add_metadata(FeaturesMatrixMeta { matrix, sites: sancov_sites });
     }
-    set_factor_params(params.clone());
+    set_feat_exists(&mut state, has_feats);
+    set_tpe_satisfied(&mut state, tpe_sat_flag);
+    if tpe_sat_flag && !vcur.is_empty() {
+        set_current_v(&mut state, vcur);
+    }
+
+    // setting funafl parameters
+    set_alpha_init(&mut state, fun_args.factor_params.alpha);
+
+    set_feat_mode(fun_args.feat_mode);
+    eprintln!("[factor-params] feat_mode={}", fun_args.feat_mode);
+
+    set_explore_time(&mut state, fun_args.explore_time_secs);
+
+    set_tpe_period(&mut state, fun_args.tpe_period_secs);
+    eprintln!("[factor-params] explore_time={} hours, tpe_period={} minutes", 
+        fun_args.explore_time_secs / 60 / 60, fun_args.tpe_period_secs / 60);
+
+    set_factor_params(&mut state, fun_args.factor_params.clone());
 
     eprintln!(
-        "[params] alpha={:.3}, beta={:.3}, gmin={:.3}, gmax={:.3}, use_tanh={}",
-        params.alpha, params.beta, params.gmin, params.gmax, params.use_tanh
+        "[factor-params] alpha={:.3}, beta={:.3}, gmin={:.3}, gmax={:.3}, use_tanh={}",
+        fun_args.factor_params.alpha, fun_args.factor_params.beta, fun_args.factor_params.gmin, fun_args.factor_params.gmax, fun_args.factor_params.use_tanh
     );
     eprintln!(
         "[params] features_enabled={}, features_map={}",
-        features_enabled(),
+        get_features_enabled(&state),
         chosen_path
             .as_ref()
             .map(|p| p.display().to_string())
@@ -592,7 +615,20 @@ fn fuzz(
         handle: sancov_handle,
         _p: core::marker::PhantomData,
     };
-    let mut stages = tuple_list!(calibration, tracing, feat_stage, i2s, power);
+
+    // build TPE stage（period from CLI -> get_tpe_period())
+    let mut tpe_stage = {
+        let mut p = TpeParams::default();
+        p.period = Duration::from_secs(get_tpe_period(&state));
+        TpeStage::new(p)
+    };
+    // record baseline corpus, for ΔCorpus reward
+    {
+        let cur_corpus = state.corpus().count();
+        tpe_stage.opt.set_last_corpus(cur_corpus);
+    }
+
+    let mut stages = tuple_list!(calibration, tracing, feat_stage, tpe_stage, i2s, power);
 
     // Read tokens
     if state.metadata_map().get::<Tokens>().is_none() {

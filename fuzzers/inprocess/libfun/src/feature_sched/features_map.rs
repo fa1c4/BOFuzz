@@ -1,7 +1,8 @@
 /*
 feature_sched/features_map.rs: load and parse the features_map.json data
 */
-use serde::Deserialize;
+use serde::{Serialize, Deserialize};
+use crate::feature_sched::{metadata::{FeaturesMapMeta, FeaturesMatrixMeta}, set_tpe_satisfied, set_current_v};
 use std::{
     collections::HashMap,
     fs::File,
@@ -12,6 +13,8 @@ use std::{
 };
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
+use libafl::Error;
+use libafl::common::HasMetadata;
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -111,7 +114,14 @@ fn derive_dir_and_target(p: &Path) -> Option<(PathBuf, String)> {
     }
 }
 
-pub fn load_and_align_features_map(path: &Path, sites: usize) -> std::io::Result<Vec<f64>> {
+pub fn load_and_align_features_map(
+    path: &Path, sites: usize,
+) -> std::io::Result<(
+    Vec<f64>, 
+    Option<std::collections::HashMap<String, Vec<f64>>>,
+    Option<Vec<f64>>,
+    bool, 
+)> {
     ensure_v_candidates_for(path);
 
     let mut f = File::open(path)?;
@@ -127,20 +137,20 @@ pub fn load_and_align_features_map(path: &Path, sites: usize) -> std::io::Result
             vec![1.0 / (d as f64).sqrt(); d]
         }
     };
-    {
-        let mut curv = CURRENT_V.write().unwrap();
-        *curv = v0.clone();
-    }
+    
+    let (feats_raw, matrix_opt, v0_opt, tpe_sat) =
+        match serde_json::from_str::<FeatsJson>(&s).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("json parse err: {e}"))
+        })? {
+            FeatsJson::Raw(feat) => (feat, None, None, false),
+            FeatsJson::Obj { features } => (features, None, None, false),
+            FeatsJson::Dict(map) => {
+                let feats = combine_feature_matrix_to_weights(map.clone(), &v0);
+                (feats, Some(map), Some(v0), true)
+            }
+        };
 
-    let feat: Vec<f64> = match serde_json::from_str::<FeatsJson>(&s).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("json parse err: {e}"))
-    })? {
-        FeatsJson::Raw(feat) => feat,
-        FeatsJson::Obj { features } => features,
-        FeatsJson::Dict(map) => combine_feature_matrix_to_weights(map, &v0),
-    };
-
-    Ok(align(feat, sites))
+    Ok((align(feats_raw, sites), matrix_opt, v0_opt, tpe_sat))
 }
 
 fn align(mut v: Vec<f64>, sites: usize) -> Vec<f64> {
@@ -211,4 +221,36 @@ pub fn combine_feature_matrix_to_weights(
         out.push(w);
     }
     out
+}
+
+pub fn apply_v_to_features<S: HasMetadata>(state: &mut S, v: &[f64]) -> Result<(), Error> {
+    // only input is matrix then recompute features_map
+    let (feats, sites) = match state.metadata_map().get::<FeaturesMatrixMeta>() {
+        Some(m) => {
+            let feats = combine_feature_matrix_to_weights(m.matrix.clone(), v);
+            (feats, m.sites)
+        }
+        None => {
+            // Flat input then skip
+            let feats = state.metadata_map()
+                .get::<FeaturesMapMeta>()
+                .map(|m| m.feats.clone())
+                .unwrap_or_default();
+            let sites = feats.len();
+            (feats, sites)
+        }
+    };
+
+    let aligned = align(feats, sites);
+    if state.metadata_map().get::<FeaturesMapMeta>().is_some() {
+        let m = state.metadata_map_mut().get_mut::<FeaturesMapMeta>().unwrap();
+        m.feats = aligned;
+    } else {
+        state.add_metadata(FeaturesMapMeta { feats: aligned });
+    }
+
+    // update v
+    set_current_v(state, v.to_vec());
+    
+    Ok(())
 }

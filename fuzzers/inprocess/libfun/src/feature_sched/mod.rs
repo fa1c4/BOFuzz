@@ -16,28 +16,106 @@ pub use sancov_index_feedback::SancovIndexFeedback;
 
 use std::sync::{RwLock, atomic::{AtomicU64, AtomicBool, Ordering}};
 use std::time::Instant;
+use libafl_bolts::current_time;
 
+pub mod tpe;
+pub mod tpe_stage;
+pub use tpe::{TpeOptimizer, TpeParams};
+pub use tpe_stage::TpeStage;
+
+pub use metadata::{FeaturesMatrixMeta, TpeHistoryMeta, FeatureGlobalsMeta, FactorParamsMeta};
+
+// TPE weight vector candidates
+pub use crate::feature_sched::features_map::{ V_CANDIDATES, CURRENT_V };
+
+use libafl::common::HasMetadata;
+use libafl::schedulers::testcase_score::get_feat_mode;
+
+fn globals_mut<S: HasMetadata>(state: &mut S) -> &mut FeatureGlobalsMeta {
+    state.metadata_map_mut().get_or_insert_with::<FeatureGlobalsMeta>(Default::default)
+}
+fn globals<S: HasMetadata>(state: &S) -> FeatureGlobalsMeta {
+    state.metadata_map().get::<FeatureGlobalsMeta>().cloned().unwrap_or_default()
+}
+
+// getters
+pub fn get_features_active<S: HasMetadata>(state: &S) -> bool { globals(state).features_active }
+pub fn get_feat_exists<S: HasMetadata>(state: &S) -> bool { globals(state).feat_exists }
+pub fn get_tpe_satisfied<S: HasMetadata>(state: &S) -> bool { globals(state).tpe_satisfied }
+pub fn get_feat0<S: HasMetadata>(state: &S) -> f64 { globals(state).feat_val0 }
+pub fn get_explore_time<S: HasMetadata>(state: &S) -> u64 { globals(state).explore_time_secs }
+pub fn get_tpe_period<S: HasMetadata>(state: &S) -> u64 { globals(state).tpe_period_secs }
+pub fn get_alpha_init<S: HasMetadata>(state: &S) -> f64 { globals(state).alpha_init }
+pub fn get_current_weight_vec<S: HasMetadata>(state: &S) -> Vec<f64> { globals(state).current_v.clone() }
+pub fn get_factor_params<S: HasMetadata>(state: &S) -> FactorParams { globals(state).factor_params.clone() }
+pub fn get_fuzz_start<S: HasMetadata>(state: &S) -> u64 { globals(state).fuzz_start_epoch_ms }
+
+// calculate features_enabled instantly
+pub fn get_features_enabled<S: HasMetadata>(state: &S) -> bool {
+    get_features_active(state) && get_feat_exists(state) && get_feat_mode() != 0
+}
+
+// setters
+pub fn set_features_active<S: HasMetadata>(state: &mut S, v: bool) {
+    globals_mut(state).features_active = v;
+}
+
+pub fn set_feat_exists<S: HasMetadata>(state: &mut S, v: bool) {
+    globals_mut(state).feat_exists = v;
+}
+
+pub fn set_tpe_satisfied<S: HasMetadata>(state: &mut S, v: bool) {
+    globals_mut(state).tpe_satisfied = v;
+}
+
+pub fn set_feat0<S: HasMetadata>(state: &mut S, v: f64) {
+    globals_mut(state).feat_val0 = v;
+}
+
+pub fn set_explore_time<S: HasMetadata>(state: &mut S, secs: u64) {
+    globals_mut(state).explore_time_secs = secs;
+}
+
+pub fn set_tpe_period<S: HasMetadata>(state: &mut S, secs: u64) {
+    globals_mut(state).tpe_period_secs = secs;
+}
+
+pub fn set_alpha_init<S: HasMetadata>(state: &mut S, v: f64) {
+    globals_mut(state).alpha_init = v;
+}
+
+pub fn set_current_v<S: HasMetadata>(state: &mut S, v: Vec<f64>) {
+    globals_mut(state).current_v = v.clone();
+}
+
+pub fn set_fuzz_start<S: HasMetadata>(state: &mut S) {
+    globals_mut(state).fuzz_start_epoch_ms = current_time().as_millis() as u64;
+}
+
+pub fn set_factor_params<S: HasMetadata>(state: &mut S, p: FactorParams) {
+    globals_mut(state).factor_params = p.clone();
+    state.add_metadata(FactorParamsMeta { params: p.clone() });
+}
+
+
+/* -- static global variants --
 // set features active flag
 pub static FEATURES_ACTIVE: AtomicBool = AtomicBool::new(false);
-// features enable switch
-pub static FEAT_ENABLED: AtomicBool = AtomicBool::new(false);
 // whether features_map exists/loaded successfully
 static FEAT_EXISTS: AtomicBool = AtomicBool::new(false);
+// whether TPE is available only when input is attrs*dim matrix
+static TPE_SATISFIED: AtomicBool = AtomicBool::new(false);
 
 // startup time record
 pub static mut FUZZ_START: Option<Instant> = None;
 
-// TPE weight vector candidates
-pub use crate::feature_sched::features_map::{ V_CANDIDATES, CURRENT_V };
-pub fn features_enabled() -> bool { FEAT_ENABLED.load(Ordering::Relaxed) }
-pub fn set_features_enabled(v: bool) { FEAT_ENABLED.store(v, Ordering::Relaxed); }
-
-pub fn feat_exists() -> bool { FEAT_EXISTS.load(Ordering::Relaxed) }
-pub fn set_feat_exists(v: bool) { FEAT_EXISTS.store(v, Ordering::Relaxed); }
-
-use libafl::schedulers::testcase_score::get_feat_mode;
-
 static FEAT_VAL0: AtomicU64 = AtomicU64::new(0);
+
+// default EXPLORE TIME is 12 hours
+static EXPLORE_TIME: AtomicU64 = AtomicU64::new(12 * 60 * 60);
+
+// default TPE study window period is 10 minutes
+static TPE_PERIOD: AtomicU64 = AtomicU64::new(10 * 60);
 
 static ALPHA_INIT: AtomicU64 = AtomicU64::new(f64::NAN.to_bits());
 
@@ -46,41 +124,4 @@ static ALPHA_INIT: AtomicU64 = AtomicU64::new(f64::NAN.to_bits());
 pub static FACTOR_PARAMS: RwLock<FactorParams> = RwLock::new(FactorParams { 
     alpha: 1.0, beta: 0.6, gmin: 0.0, gmax: 3.0, use_tanh: false 
 });
-
-// Function to set the factor parameters
-pub fn set_factor_params(p: FactorParams) {
-    let mut params = FACTOR_PARAMS.write().unwrap();
-    *params = p;
-}
-
-// Function to get the factor parameters
-pub fn get_factor_params() -> FactorParams {
-    let params = FACTOR_PARAMS.read().unwrap();
-    params.clone() // Clone to avoid borrowing issues
-}
-
-// Function to get current weight vector
-pub fn get_current_weight_vec() -> Vec<f64> {
-    CURRENT_V.read().unwrap().clone()
-}
-
-pub fn recompute_features_enabled() {
-    let enabled = FEATURES_ACTIVE.load(Ordering::Relaxed)
-        && FEAT_EXISTS.load(Ordering::Relaxed)
-        && get_feat_mode() != 0;
-    FEAT_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-pub fn set_feat0(v: f64) {
-    FEAT_VAL0.store(v.to_bits(), Ordering::Relaxed);
-}
-pub fn get_feat0() -> f64 {
-    f64::from_bits(FEAT_VAL0.load(Ordering::Relaxed))
-}
-
-pub fn set_alpha_init(v: f64) {
-    ALPHA_INIT.store(v.to_bits(), Ordering::Relaxed);
-}
-pub fn get_alpha_init() -> f64 {
-    f64::from_bits(ALPHA_INIT.load(Ordering::Relaxed))
-}
+*/
