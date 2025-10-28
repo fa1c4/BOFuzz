@@ -162,20 +162,21 @@ where
         if let Some(s) = tpe_raw {
             if let Some(parsed) = parse_tpe_info(&s) {
                 let mut extra = String::new();
-                write!(
-                    extra,
-                    "[tpe-info] ΔCorpus={:.2} trials={} corpus={} α={:.2} ‖v‖={:.2} bw={:.2} γ={:.2} samples={} period={} v={}",
-                    parsed.reward,
-                    parsed.trials,
-                    parsed.corpus,
-                    parsed.alpha,
-                    parsed.v_norm,
-                    parsed.bw,
-                    parsed.gamma,
-                    parsed.samples,
-                    parsed.period,
-                    parsed.v8
-                ).unwrap();
+                    write!(
+                        extra,
+                        "[tpe-info] ΔEdges={:.1} Coverage={} trials={} corpus={} α={:.2} ‖v‖={:.2} bw={:.2} γ={:.2} samples={} period={} v={}",
+                        parsed.reward,   // ΔEdges
+                        parsed.cov,      // Coverage
+                        parsed.trials,   // trials
+                        parsed.corpus,   // corpus
+                        parsed.alpha,    // α
+                        parsed.v_norm,   // ‖v‖
+                        parsed.bw,       // bw
+                        parsed.gamma,    // γ
+                        parsed.samples,  // samples
+                        parsed.period,   // period
+                        parsed.vec        // v
+                    ).unwrap();
                 (self.print_fn)(&extra);
             } else {
                 (self.print_fn)(&format!("[tpe-info] {s}"));
@@ -205,11 +206,12 @@ struct FeaturesInfo {
 #[derive(Default)]
 struct TpeInfo {
     reward: f64,
+    cov: f64,
     trials: u64,
     corpus: u64,
     alpha: f64,
     v_norm: f64,
-    v8: String,
+    vec: String,
     bw: f64,
     gamma: f64,
     samples: u64,
@@ -253,11 +255,12 @@ fn parse_tpe_info(s: &str) -> Option<TpeInfo> {
         let (k, v) = split_kv(seg)?;
         match k {
             "reward" => out.reward = parse_trailing_num(v),
+            "Coverage" => out.cov = parse_trailing_num(v),
             "trials" => out.trials = v.parse().ok().unwrap_or(0),
             "corpus" => out.corpus = v.parse().ok().unwrap_or(0),
             "alpha" => out.alpha = parse_num(v),
             "v_norm" => out.v_norm = parse_num(v),
-            "v8" => out.v8 = v.to_string(),
+            "v0_8" => out.vec = v.to_string(),
             "bw" => out.bw = parse_num(v),
             "gamma" => out.gamma = parse_num(v),
             "samples" => out.samples = v.parse().ok().unwrap_or(0),

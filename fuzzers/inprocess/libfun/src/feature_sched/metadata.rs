@@ -71,6 +71,7 @@ pub struct TpeHistoryMeta {
     pub last_vec: Vec<f64>,
     pub last_check_ms: Option<u64>,
     pub last_corpus: Option<usize>,
+    pub last_cov: Option<usize>,
     pub max_trials: usize,
 }
 

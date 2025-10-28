@@ -5,9 +5,18 @@ use libafl::{
     inputs::BytesInput, executors::HasObservers, state::HasCorpus,
     observers::ObserversTuple, Error,
 };
+use libafl::common::HasMetadata;
 use libafl::corpus::Corpus;
 use libafl::events::Event;
 use libafl::monitors::{AggregatorOps, UserStats, UserStatsValue};
+use libafl::observers::MapObserver;
+use libafl_bolts::tuples::Handle;
+use libafl::observers::HitcountsMapObserver;
+use libafl::observers::map::StdMapObserver;
+use libafl_bolts::tuples::MatchNameRef;
+use libafl_bolts::Named;
+use libafl::HasNamedMetadata;
+use libafl::feedbacks::MapFeedbackMetadata;
 
 use super::tpe::{TpeOptimizer, TpeParams};
 use super::{
@@ -21,11 +30,12 @@ use crate::feature_sched::{get_features_enabled, get_tpe_satisfied, get_v_candid
 pub struct TpeStage {
     pub opt: TpeOptimizer,
     rng: StdRand,
+    edges_name: String,
 }
 
 impl TpeStage {
-    pub fn new(params: TpeParams) -> Self {
-        Self { opt: TpeOptimizer::new(params), rng: StdRand::new() }
+    pub fn new(params: TpeParams, edges_name: impl Into<String>) -> Self {
+        Self { opt: TpeOptimizer::new(params), rng: StdRand::new(), edges_name: edges_name.into() }
     }
 }
 
@@ -33,7 +43,9 @@ impl<E, EM, S, Z> Stage<E, EM, S, Z> for TpeStage
 where
     E: Executor<EM, BytesInput, S, Z> + HasObservers,
     EM: EventFirer<BytesInput, S>,
-    S: HasCorpus<BytesInput> + libafl::common::HasMetadata,
+    S: HasCorpus<BytesInput>
+        + libafl::common::HasMetadata
+        + libafl::HasNamedMetadata,
 {
     fn perform(
         &mut self,
@@ -42,6 +54,10 @@ where
         state: &mut S,
         _mgr: &mut EM,
     ) -> Result<(), Error> {
+        if !self.opt.window_due() {
+            return Ok(());
+        }
+
         // init weight_vec = [alpha, w_1, ..., w_dim]
         {
             let params = get_factor_params(state);
@@ -60,8 +76,18 @@ where
         }
 
         // calculate reward: ΔCorpus
-        let cur_corpus = state.corpus().count();
-        let reward = self.opt.take_reward_from_corpus(cur_corpus).unwrap_or(0.0);
+        // let cur_corpus = state.corpus().count();
+        // let reward = self.opt.take_reward_from_corpus(cur_corpus).unwrap_or(0.0);
+        // calculate reward: ΔEdges
+        let (cur_cov, cov_len) = if let Some(meta) =
+            state.named_metadata_map().get::<MapFeedbackMetadata<u8>>(&self.edges_name)
+        {
+            (meta.num_covered_map_indexes, meta.history_map.len())
+        } else { (0, 0) };
+
+        let reward = self.opt
+            .take_reward_from_coverage(cur_cov)
+            .unwrap_or(0.0);
 
         // record history
         let last = self.opt.last_vec();
@@ -79,9 +105,9 @@ where
             apply_v_to_features(state, &new_vec[1..9])?;
         }
 
-        // mark end of window
-        self.opt.mark_tick();
-
+        // start new window
+        self.opt.advance_window();
+        self.opt.set_last_cov(cur_cov);
         // store to metadata
         self.opt.persist_to_meta(state);
 
@@ -98,7 +124,7 @@ where
 
             let v_show = if new_vec.len() >= 9 {
                 let mut s = String::new();
-                for (i, x) in new_vec[1..9].iter().enumerate() {
+                for (i, x) in new_vec[..9].iter().enumerate() {
                     if i > 0 { s.push(','); }
                     s.push_str(&format!("{:.2}", x));
                 }
@@ -106,11 +132,11 @@ where
             } else { "[]".to_string() };
 
             let summary = format!(
-                "reward=ΔCorpus={:.2}, trials={}, corpus={}, alpha={:.2}, \
-                v_norm={:.2}, v8={}, bw={:.2}, gamma={:.2}, samples={}, period={:?}",
-                reward, trials_len, corpus_now, alpha,
+                "reward=ΔEdges={:.2}, Coverage={:.1}, trials={}, corpus={}, alpha={:.2}, \
+                v_norm={:.2}, v0_8={}, bw={:.2}, gamma={:.2}, samples={}, period={:?}",
+                reward, cur_cov, trials_len, corpus_now, alpha,
                 v_norm, v_show, self.opt.params.bw, self.opt.params.gamma,
-                self.opt.params.samples, self.opt.params.period
+                self.opt.params.samples, self.opt.params.period,
             );
 
             _mgr.fire(
@@ -128,9 +154,9 @@ where
 
     fn should_restart(&mut self, _state: &mut S) -> Result<bool, Error> {
         // restore TPE history from metadata
-        self.opt.restore_from_meta(_state);
-
-        Ok(get_features_enabled(_state) && get_tpe_satisfied(_state) && self.opt.should_tick())
+        self.opt.restore_once(_state);
+        
+        Ok(get_features_enabled(_state) && get_tpe_satisfied(_state) && self.opt.window_due())
     }
 
     fn clear_progress(&mut self, _state: &mut S) -> Result<(), Error> {

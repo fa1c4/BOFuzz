@@ -5,7 +5,12 @@ use libafl_bolts::{rands::{StdRand, Rand}, current_time};
 use core::num::NonZeroUsize;
 use libafl::common::HasMetadata;
 use crate::feature_sched::TpeHistoryMeta;
-use crate::feature_sched::{get_v_candidates, push_v_candidate, vecn_eq};
+use crate::feature_sched::{get_v_candidates, push_v_candidate, vecn_eq, replace_v_candidates};
+
+use libafl::observers::MapObserver;
+use libafl_bolts::tuples::Handle;
+use libafl::observers::HitcountsMapObserver;
+use libafl::observers::map::StdMapObserver;
 
 #[derive(Clone, Debug)]
 pub struct TpeParams {
@@ -31,11 +36,13 @@ pub struct Trial {
 pub struct TpeState {
     pub trials: Vec<Trial>,
     pub last_vec: Vec<f64>,         // last applying vector
-    pub last_check: Option<Instant>,
+    pub window_start: Option<Instant>,
     pub last_corpus: Option<usize>, // last corpus.count of window
+    pub last_cov: Option<usize>,    // last coverage edges of window
     pub no_new_counter: usize,      
     pub lock_best: bool,            // convergence flag
     pub best_fixed: Vec<f64>,       // best vec
+    pub restored_once: bool,        // TpeStage entry restore once
 }
 
 fn now_epoch_ms() -> u64 {
@@ -61,11 +68,57 @@ impl TpeOptimizer {
         Self { params, state: RwLock::new(TpeState::default()) }
     }
 
+    pub fn restore_once<S: HasMetadata>(&self, state: &S) {
+        let mut s = self.state.write().unwrap();
+        if s.restored_once { return; }
+        s.restored_once = true;
+
+        if let Some(meta) = state.metadata_map().get::<TpeHistoryMeta>() {
+            s.trials.clear();
+            s.trials.reserve(meta.trials.len());
+            for (v, r, _ts) in &meta.trials {
+                s.trials.push(Trial { vec: v.clone(), reward: *r });
+            }
+
+            let max_trials = if meta.max_trials == 0 { 1024 } else { meta.max_trials };
+            if s.trials.len() > max_trials {
+                let drop_n = s.trials.len() - max_trials;
+                s.trials.drain(0..drop_n);
+            }
+
+            s.last_vec = meta.last_vec.clone();
+            s.last_corpus = None;
+            s.last_cov = None;
+
+            s.window_start = Some(Instant::now());
+        }
+    }
+
+    pub fn window_due(&self) -> bool {
+        let s = self.state.read().unwrap();
+        match s.window_start {
+            None => true,
+            Some(t0) => t0.elapsed() >= self.params.period,
+        }
+    }
+
+    pub fn advance_window(&self) {
+        let mut s = self.state.write().unwrap();
+        s.window_start = Some(Instant::now());
+    }
+
+    pub fn window_elapsed(&self) -> Duration {
+        let s = self.state.read().unwrap();
+        match s.window_start {
+            None => Duration::ZERO,
+            Some(t0) => t0.elapsed(),
+        }
+    }
+
     pub fn init_vec_if_empty(&self, v0: &[f64]) {
         let mut s = self.state.write().unwrap();
         if s.last_vec.is_empty() {
             s.last_vec = v0.to_vec();
-            s.last_check = Some(Instant::now());
         }
     }
 
@@ -80,8 +133,111 @@ impl TpeOptimizer {
         }
     }
 
+    fn gen_kde_candidates<S: HasMetadata>(&self, state: &mut S, rng: &mut StdRand) -> usize {
+        let (lset, gset, _y_star) = match self.split_l_g() {
+            Some(x) => x,
+            None => return 0,
+        };
+
+        let pool = get_v_candidates(state);
+        let hist = {
+            let s = self.state.read().unwrap();
+            s.trials.iter().map(|t| t.vec.clone()).collect::<Vec<_>>()
+        };
+
+        let eps = 1e-6;
+        let mut best: Option<(f64, Vec<f64>)> = None;
+
+        for base_trial in &lset {
+            let base = &base_trial.vec;
+            let d = base.len();
+
+            let mut cand = vec![0.0; d];
+            for j in 0..d {
+                let z = rand_gaussian(rng);                 // N(0,1)
+                let mut v = base[j] + self.params.bw * z;   // width h = bw
+                if v < 0.0 { v = -v; }                      // reflect [0,1]
+                if v > 1.0 { v = 2.0 - v; }
+                cand[j] = v.clamp(0.0, 1.0);
+            }
+            let cand = project_vec(cand);
+
+            let dup_hist = hist.iter().any(|h| h.len() == cand.len() && vecn_eq(h, &cand, 1e-3));
+            if dup_hist {
+                continue;
+            }
+            let dup_pool = pool.iter().any(|p| p.len() == cand.len() && vecn_eq(p, &cand, 1e-3));
+            if dup_pool {
+                continue;
+            }
+
+            let l = kde_pdf_reflect(&lset, &cand, self.params.bw);
+            let g = kde_pdf_reflect(&gset, &cand, self.params.bw);
+            let score = if g > 0.0 { l / g } else { f64::INFINITY };
+            if score <= 1.0 + eps {
+                continue;
+            }
+
+            match best {
+                None => best = Some((score, cand)),
+                Some((best_s, _)) if score > best_s => best = Some((score, cand)),
+                _ => {}
+            }
+        }
+
+        if let Some((_score, chosen)) = best {
+            push_v_candidate(state, chosen);
+            1
+        } else {
+            0
+        }
+    }
+
+    fn gen_kde_candidates_allin_L<S: HasMetadata>(&self, state: &mut S, rng: &mut StdRand) -> usize {
+        let (lset, gset, _y_star) = match self.split_l_g() {
+            Some(x) => x,
+            None => return 0, // history too few
+        };
+
+        let mut pool = get_v_candidates(state);
+        let hist = {
+            let s = self.state.read().unwrap();
+            s.trials.iter().map(|t| t.vec.clone()).collect::<Vec<_>>()
+        };
+
+        let eps = 1e-6;
+        let mut added = 0usize;
+        for _ in 0..self.params.samples {
+            let cand = project_vec(sample_from_kde_reflect(&lset, self.params.bw, rng));
+
+            let l = kde_pdf_reflect(&lset, &cand, self.params.bw);
+            let g = kde_pdf_reflect(&gset, &cand, self.params.bw);
+            let score = if g > 0.0 { l / g } else { f64::INFINITY };
+
+            if score <= 1.0 + eps {
+                continue;
+            }
+
+            let dup_hist = hist.iter().any(|h| h.len() == cand.len() && vecn_eq(h, &cand, 1e-3));
+            if dup_hist {
+                continue;
+            }
+
+            let dup_pool = pool.iter().any(|p| p.len() == cand.len() && vecn_eq(p, &cand, 1e-3));
+            if dup_pool {
+                continue;
+            }
+
+            push_v_candidate(state, cand.clone());
+            pool.push(cand);
+            added += 1;
+        }
+
+        added
+    }
+
     pub fn suggest<S: HasMetadata>(&self, state: &mut S, rng: &mut StdRand) -> Vec<f64> {
-        // 1) if reached covergence then return best_v
+        // 1) convergence: return best_v
         {
             let s = self.state.read().unwrap();
             if s.lock_best && !s.best_fixed.is_empty() {
@@ -89,85 +245,30 @@ impl TpeOptimizer {
             }
         }
 
-        // 2) warmup: apply weight_vec in candidates without reward
+        // 2) from Lset generate new vec with KDE sampling which reward_prediction >0
+        let _added = self.gen_kde_candidates(state, rng);
+
+        // 3) get next untried vec to apply 
         if let Some(v) = self.next_untried_from_pool(state) {
             return v;
         }
 
-        // 3) TPE optimizing: fetch l/g best vec then KDE to get new vec
-        let added = self.refine_best_to_candidates(state, rng, 4);
-        if added > 0 {
-            if let Some(v) = self.next_untried_from_pool(state) {
-                return v;
-            }
-        }
+        // 4) queue is empty then no more vec satisfied reward > 0: set convergence then return best_v in history
+        let best = self.best_by_lg()
+            .or_else(|| {
+                let s = self.state.read().unwrap();
+                if s.last_vec.is_empty() { None } else { Some(s.last_vec.clone()) }
+            })
+            .unwrap_or_else(|| {
+                vec![0.5; 9]
+            });
 
-        // 4) no new candidates up to 3 times, then lock best in history 
         {
             let mut s = self.state.write().unwrap();
-            if added == 0 {
-                s.no_new_counter += 1;
-                if s.no_new_counter >= 3 {
-                    if let Some(best) = self.best_by_lg() {
-                        s.best_fixed = best.clone();
-                        s.lock_best = true;
-                        s.no_new_counter = 0;
-                        return s.best_fixed.clone();
-                    }
-                }
-            } else {
-                s.no_new_counter = 0;
-            }
+            s.best_fixed = best.clone();
+            s.lock_best = true;
         }
-
-        // 5) if samples are too few, use disturbance to generate new vecs; 
-        let s = self.state.read().unwrap();
-        if s.trials.len() < 5 {
-            return jitter_and_project(&s.last_vec, rng);
-        }
-        drop(s);
-
-        // 6) otherwise sampling as KDE
-        let (lset, gset, _y_star) = match self.split_l_g() {
-            Some(x) => x,
-            None => {
-                let s = self.state.read().unwrap();
-                return jitter_and_project(&s.last_vec, rng);
-            }
-        };
-
-        let mut best = None;
-        for _ in 0..self.params.samples {
-            let cand = sample_from_kde_reflect(&lset, self.params.bw, rng);
-            let l = kde_pdf_reflect(&lset, &cand, self.params.bw);
-            let g = kde_pdf_reflect(&gset, &cand, self.params.bw);
-            let score = if g > 0.0 { l / g } else { f64::INFINITY };
-            match best {
-                None => best = Some((score, cand)),
-                Some((bs, _)) if score > bs => best = Some((score, cand)),
-                _ => {}
-            }
-        }
-        best.map(|(_, v)| project_vec(v))
-            .unwrap_or_else(|| {
-                let s = self.state.read().unwrap();
-                jitter_and_project(&s.last_vec, rng)
-            })
-    }
-
-    // tpe window is over
-    pub fn should_tick(&self) -> bool {
-        let s = self.state.read().unwrap();
-        match s.last_check {
-            None => true,
-            Some(t) => t.elapsed() >= self.params.period,
-        }
-    }
-
-    // mark as tick
-    pub fn mark_tick(&self) {
-        let mut s = self.state.write().unwrap();
-        s.last_check = Some(Instant::now());
+        best
     }
 
     pub fn set_last_vec(&self, v: &[f64]) {
@@ -177,6 +278,17 @@ impl TpeOptimizer {
 
     pub fn last_vec(&self) -> Vec<f64> {
         self.state.read().unwrap().last_vec.clone()
+    }
+
+    pub fn set_last_cov(&self, n: usize) {
+        let mut s = self.state.write().unwrap();
+        s.last_cov = Some(n);
+    }
+    pub fn take_reward_from_coverage(&self, cur_cov: usize) -> Option<f64> {
+        let mut s = self.state.write().unwrap();
+        let r = s.last_cov.map(|prev| (cur_cov as i64 - prev as i64) as f64);
+        s.last_cov = Some(cur_cov);
+        r
     }
 
     pub fn set_last_corpus(&self, n: usize) {
@@ -207,37 +319,35 @@ impl TpeOptimizer {
         }
         meta.last_vec = s.last_vec.clone();
         meta.last_corpus = s.last_corpus;
+        meta.last_cov = s.last_cov;
         meta.last_check_ms = Some(now_epoch_ms());
     }
 
-    pub fn restore_from_meta<S: HasMetadata>(&self, state: &S) {
-        if let Some(meta) = state.metadata_map().get::<TpeHistoryMeta>() {
-            let mut s = self.state.write().unwrap();
-            s.trials.clear();
-            s.trials.reserve(meta.trials.len());
-            for (v, r, _ts) in &meta.trials {
-                s.trials.push(Trial { vec: v.clone(), reward: *r });
-            }
-            s.last_vec = meta.last_vec.clone();
-            s.last_corpus = meta.last_corpus;
-            s.last_check = meta.last_check_ms.map(|_| Instant::now());
-        }
-    }
-
     // traverse all init candidates weight_vec
-    pub fn next_untried_from_pool<S: HasMetadata>(&self, state: &S) -> Option<Vec<f64>> {
-        let pool = get_v_candidates(state);
-        let s = self.state.read().unwrap();
-        'outer: for v9 in pool.iter() {
-            for t in &s.trials {
-                // same vec in history then continue
-                if t.vec.len() == v9.len() && vecn_eq(&t.vec, v9, 1e-3) {
-                    continue 'outer;
-                }
+    pub fn next_untried_from_pool<S: HasMetadata>(&self, state: &mut S) -> Option<Vec<f64>> {
+        let hist = {
+            let s = self.state.read().unwrap();
+            s.trials.iter().map(|t| &t.vec).cloned().collect::<Vec<_>>()
+        };
+        let mut pool = get_v_candidates(state);
+
+        while let Some(front) = pool.first() {
+            let seen = hist.iter().any(|h| h.len() == front.len() && vecn_eq(h, front, 1e-3));
+            if seen {
+                pool.remove(0);
+            } else {
+                break;
             }
-            return Some(project_vec(v9.clone()));
         }
-        None
+      
+        let out = if pool.is_empty() {
+            None
+        } else {
+            Some(project_vec(pool.remove(0)))
+        };
+        replace_v_candidates(state, pool);
+
+        out
     }
 
     // calculate L/G sets and threshold according to trials, empty then return None
@@ -287,20 +397,6 @@ impl TpeOptimizer {
             }
         }
         best.map(|(_, v)| v)
-    }
-
-    // KDE sample from best vec, then put new vecs into V_CANDIDATES (not redundant), return number of new vecs
-    pub fn refine_best_to_candidates<S: HasMetadata>(
-        &self, state: &mut S, rng: &mut StdRand, k: usize
-    ) -> usize {
-        let (lset, _gset, _) = match self.split_l_g() { Some(x) => x, None => return 0 };
-        let mut added = 0usize;
-        for _ in 0..k {
-            let cand = project_vec(sample_from_kde_reflect(&lset, self.params.bw, rng));
-            push_v_candidate(state, cand);
-            added += 1;
-        }
-        added
     }
 }
 

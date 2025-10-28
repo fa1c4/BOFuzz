@@ -169,7 +169,7 @@ where
             let params = get_factor_params(state);
             let v_now = get_current_weight_vec(state);
             let cand_cnt = get_v_candidates(state).len();
-            let v_str = fmt_vec_short(&v_now, 8);
+            let v_str = fmt_vec_short(&v_now, 9);
 
             let summary = format!(
                 "enabled={}, active={}, feat_mode={}, feat_exists={}, \
@@ -201,6 +201,10 @@ where
         // if no features_map then cold fuzzing forever
         if !get_feat_exists(_state) {
             return Ok(false);
+        }
+
+        if get_features_active(_state) {
+            return Ok(true);
         }
 
         let now_ms = current_time().as_millis() as u64;

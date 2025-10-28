@@ -54,7 +54,7 @@ pub fn get_features_enabled<S: HasMetadata>(state: &S) -> bool {
     get_features_active(state) && get_feat_exists(state) && get_feat_mode(state) != 0
 }
 
-pub fn get_v_candidates<S: HasMetadata>(state: &S) -> Vec<Vec<f64>> {
+pub fn get_v_candidates<S: HasMetadata>(state: &mut S) -> Vec<Vec<f64>> {
     globals(state).v_candidates
 }
 
@@ -101,7 +101,6 @@ pub fn set_fuzz_start<S: HasMetadata>(state: &mut S) {
 
 pub fn set_factor_params<S: HasMetadata>(state: &mut S, p: FactorParams) {
     globals_mut(state).factor_params = p.clone();
-    state.add_metadata(FactorParamsMeta { params: p.clone() });
 }
 
 pub fn push_v_candidate<S: HasMetadata>(state: &mut S, v: Vec<f64>) {

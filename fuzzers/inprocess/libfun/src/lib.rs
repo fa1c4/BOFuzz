@@ -375,8 +375,11 @@ fn fuzz(
     };
 
     // Create an observation channel using the coverage map
-    let edges_observer =
-        HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
+    // let edges_observer =
+    //     HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
+    // let edges_handle = edges_observer.handle();
+    let edges_observer = HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
+
     // in libfun we use sancov cntrs_ptr to align indices with static features
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     let (sancov_observer, sancov_sites, cntrs_ptr) = unsafe {
@@ -439,6 +442,14 @@ fn fuzz(
         .unwrap()
     });
 
+    // setting funafl parameters
+    set_alpha_init(&mut state, fun_args.factor_params.alpha);
+    set_factor_params(&mut state, fun_args.factor_params.clone());
+    eprintln!(
+        "[factor-params] alpha={:.3}, beta={:.3}, gmin={:.3}, gmax={:.3}, use_tanh={}",
+        fun_args.factor_params.alpha, fun_args.factor_params.beta, fun_args.factor_params.gmin, fun_args.factor_params.gmax, fun_args.factor_params.use_tanh
+    );
+
     fn default_features_path() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
@@ -485,9 +496,6 @@ fn fuzz(
     }
     set_feat_exists(&mut state, has_feats);
 
-    // setting funafl parameters
-    set_alpha_init(&mut state, fun_args.factor_params.alpha);
-
     set_feat_mode(&mut state, fun_args.feat_mode);
     eprintln!("[factor-params] feat_mode={}", fun_args.feat_mode);
 
@@ -497,12 +505,6 @@ fn fuzz(
     eprintln!("[factor-params] explore_time={} hours, tpe_period={} minutes", 
         fun_args.explore_time_secs / 60 / 60, fun_args.tpe_period_secs / 60);
 
-    set_factor_params(&mut state, fun_args.factor_params.clone());
-
-    eprintln!(
-        "[factor-params] alpha={:.3}, beta={:.3}, gmin={:.3}, gmax={:.3}, use_tanh={}",
-        fun_args.factor_params.alpha, fun_args.factor_params.beta, fun_args.factor_params.gmin, fun_args.factor_params.gmax, fun_args.factor_params.use_tanh
-    );
     eprintln!(
         "[params] features_enabled={}, features_map={}",
         get_features_enabled(&state),
@@ -610,10 +612,11 @@ fn fuzz(
     };
 
     // build TPE stage（period from CLI -> get_tpe_period())
+    let edges_name = "edges".to_string();
     let tpe_stage = {
         let mut p = TpeParams::default();
         p.period = Duration::from_secs(get_tpe_period(&state));
-        TpeStage::new(p)
+        TpeStage::new(p, edges_name.clone())
     };
     // record baseline corpus, for ΔCorpus reward
     {
@@ -621,7 +624,7 @@ fn fuzz(
         tpe_stage.opt.set_last_corpus(cur_corpus);
     }
 
-    let mut stages = tuple_list!(calibration, tracing, feat_stage, tpe_stage, i2s, power);
+    let mut stages = tuple_list!(calibration, tracing, feat_stage, i2s, power, tpe_stage);
 
     // Read tokens
     if state.metadata_map().get::<Tokens>().is_none() {

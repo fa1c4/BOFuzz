@@ -19,9 +19,9 @@ debug = true
 
 [profile.release-libfun]
 inherits = "release"
-debug = false
 # debug = true
 # opt-level = 0
+debug = false
 opt-level = 3
 strip = true
 
