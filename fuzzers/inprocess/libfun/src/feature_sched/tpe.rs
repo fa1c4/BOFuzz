@@ -22,7 +22,7 @@ pub struct TpeParams {
 
 impl Default for TpeParams {
     fn default() -> Self {
-        Self { gamma: 0.2, samples: 64, bw: 0.15, period: Duration::from_secs(60) }
+        Self { gamma: 0.2, samples: 32, bw: 0.05, period: Duration::from_secs(60) }
     }
 }
 
