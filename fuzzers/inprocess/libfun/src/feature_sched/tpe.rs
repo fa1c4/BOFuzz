@@ -12,6 +12,8 @@ use libafl_bolts::tuples::Handle;
 use libafl::observers::HitcountsMapObserver;
 use libafl::observers::map::StdMapObserver;
 
+use core::fmt::Write as _;
+
 #[derive(Clone, Debug)]
 pub struct TpeParams {
     pub gamma: f64,       // quantile threshold, like 0.2
@@ -32,7 +34,7 @@ pub struct Trial {
     pub reward: f64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TpeState {
     pub trials: Vec<Trial>,
     pub last_vec: Vec<f64>,         // last applying vector
@@ -43,6 +45,24 @@ pub struct TpeState {
     pub lock_best: bool,            // convergence flag
     pub best_fixed: Vec<f64>,       // best vec
     pub restored_once: bool,        // TpeStage entry restore once
+    pub first_window: bool,         // TpeStage starting window
+}
+
+impl Default for TpeState {
+    fn default() -> Self {
+        Self {
+            trials: Vec::new(),
+            last_vec: Vec::new(),
+            window_start: None,
+            last_corpus: None,
+            last_cov: None,
+            no_new_counter: 0,
+            lock_best: false,
+            best_fixed: Vec::new(),
+            restored_once: false,
+            first_window: true,
+        }
+    }
 }
 
 fn now_epoch_ms() -> u64 {
@@ -91,7 +111,16 @@ impl TpeOptimizer {
             s.last_cov = None;
 
             s.window_start = Some(Instant::now());
+            s.first_window = true;
         }
+    }
+
+    pub fn is_first_window(&self) -> bool {
+        self.state.read().unwrap().first_window
+    }
+
+    pub fn finish_first_window(&self) {
+        self.state.write().unwrap().first_window = false;
     }
 
     pub fn window_due(&self) -> bool {
@@ -113,6 +142,10 @@ impl TpeOptimizer {
             None => Duration::ZERO,
             Some(t0) => t0.elapsed(),
         }
+    }
+
+    pub fn has_last_vec(&self) -> bool {
+        !self.state.read().unwrap().last_vec.is_empty()
     }
 
     pub fn init_vec_if_empty(&self, v0: &[f64]) {
@@ -254,14 +287,22 @@ impl TpeOptimizer {
         }
 
         // 4) queue is empty then no more vec satisfied reward > 0: set convergence then return best_v in history
-        let best = self.best_by_lg()
-            .or_else(|| {
-                let s = self.state.read().unwrap();
-                if s.last_vec.is_empty() { None } else { Some(s.last_vec.clone()) }
-            })
-            .unwrap_or_else(|| {
-                vec![0.5; 9]
-            });
+        let best = {
+            let srd = self.state.read().unwrap();
+            let all_nonpos = !srd.trials.is_empty() && srd.trials.iter().all(|t| t.reward <= 0.0);
+            if all_nonpos {
+                srd.trials.first().map(|t| t.vec.clone())
+            } else {
+                None
+            }
+        }.or_else(|| self.best_by_lg())
+        .or_else(|| {
+            let s = self.state.read().unwrap();
+            if s.last_vec.is_empty() { None } else { Some(s.last_vec.clone()) }
+        })
+        .unwrap_or_else(|| {
+            vec![0.5; 9]
+        });
 
         {
             let mut s = self.state.write().unwrap();
@@ -321,6 +362,25 @@ impl TpeOptimizer {
         meta.last_corpus = s.last_corpus;
         meta.last_cov = s.last_cov;
         meta.last_check_ms = Some(now_epoch_ms());
+    }
+
+    pub fn snapshot_trials_text(&self) -> String {
+        let s = self.state.read().unwrap();
+        let mut out = String::new();
+        let _ = writeln!(&mut out, "[tpe-trials] count={}", s.trials.len());
+        for (i, t) in s.trials.iter().enumerate() {
+            let take = t.vec.len().min(9);
+            let vv = t.vec[..take].iter()
+                .map(|x| format!("{:.4}", x))
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = writeln!(
+                &mut out,
+                "[tpe-trial #{i}] ΔEdges={:.3} vec=[{}] len={}",
+                t.reward, vv, t.vec.len()
+            );
+        }
+        out
     }
 
     // traverse all init candidates weight_vec

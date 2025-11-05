@@ -14,7 +14,7 @@ use libafl::{
     monitors::{AggregatorOps, UserStats, UserStatsValue},
 };
 use libafl_bolts::{tuples::{Handle, MatchNameRef}, AsIter, current_time};
-use super::metadata::{PathWeightMeta, GlobalStatsMeta, FeaturesMapMeta};
+use super::metadata::{PathWeightMeta, GlobalStatsMeta, FeaturesMapMeta, TpeHistoryMeta};
 use super::stats::WeightStats;
 
 use libafl::schedulers::testcase_score::ExternalPerfMultMeta;
@@ -30,6 +30,20 @@ pub struct FeaturesAccountingStage<C> {
     // pub map_name: &'static str,
     pub handle: Handle<C>,
     pub _p: core::marker::PhantomData<C>,
+    // TPE driving mgr fire
+    last_emit_tpe_ts: u64,
+    last_emit_trials_len: usize,
+}
+
+impl<C> FeaturesAccountingStage<C> {
+    pub fn new(handle: Handle<C>) -> Self {
+        Self {
+            handle,
+            _p: core::marker::PhantomData,
+            last_emit_tpe_ts: 0,
+            last_emit_trials_len: 0,
+        }
+    }
 }
 
 fn fmt_vec_short(v: &[f64], maxn: usize) -> String {
@@ -160,7 +174,17 @@ where
         meta.stats.update(w);
 
         // message monitor callback
-        {
+        let (tpe_ts, tpe_trials_len) = if let Some(tm) = state.metadata_map().get::<TpeHistoryMeta>() {
+            (tm.last_check_ms.unwrap_or(0), tm.trials.len())
+        } else {
+            (0, 0)
+        };
+        let should_fire = tpe_ts > self.last_emit_tpe_ts || tpe_trials_len > self.last_emit_trials_len;
+        
+        if should_fire {
+            self.last_emit_tpe_ts = tpe_ts;
+            self.last_emit_trials_len = tpe_trials_len;
+            
             let enabled = get_features_enabled(state);
             let active  = get_features_active(state);
             let feat_exists = get_feat_exists(state);

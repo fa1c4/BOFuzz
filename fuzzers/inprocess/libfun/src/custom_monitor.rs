@@ -86,7 +86,7 @@ where
     }
 
     fn display(&mut self, event_msg: &str, sender_id: ClientId) {
-        let mut line = format!(
+        let line = format!(
             "[{} #{}] run time: {}, clients: {}, corpus: {}, objectives: {}, executions: {}, exec/sec: {}",
             event_msg,
             sender_id.0,
@@ -97,90 +97,75 @@ where
             self.total_execs(),
             self.execs_per_sec_pretty()
         );
-
-        if self.print_user_monitor {
-            self.client_stats_insert(sender_id);
-            let client = self.client_stats_mut_for(sender_id);
-            for (key, val) in &client.user_monitor {
-                if key.as_ref() == "features-info" || key.as_ref() == "tpe-info" {
-                    continue;
-                }
-                write!(line, ", {key}: {val}").unwrap();
-            }
-        }
-
         (self.print_fn)(&line);
 
+        let print_user_monitor = self.print_user_monitor;
+
+        let mut to_print: Vec<String> = Vec::new();
+
         self.client_stats_insert(sender_id);
-        let features_raw: Option<String>;
-        let tpe_raw: Option<String>;
         {
-            let client = self.client_stats_for(sender_id);
-            features_raw = client.user_monitor.get("features-info").and_then(|u| {
-                if let UserStatsValue::String(s) = u.value() {
-                    Some(s.to_string())
-                } else {
-                    None
-                }
-            });
-            tpe_raw = client.user_monitor.get("tpe-info").and_then(|u| {
-                if let UserStatsValue::String(s) = u.value() {
-                    Some(s.to_string())
-                } else {
-                    None
-                }
-            });
-        }
+            let client = self.client_stats_mut_for(sender_id);
 
-        if let Some(s) = features_raw {
-            if let Some(parsed) = parse_features_info(&s) {
-                let mut extra = String::new();
-                write!(
-                    extra,
-                    "[features-info] enabled={} active={} mode={} exists={} α={:.2} β={:.2} g=[{:.2},{:.2}] tanh={} v_cands={} feat0={:.3} path_w={:.3} factor={:.3} v={}",
-                    parsed.enabled,
-                    parsed.active,
-                    parsed.feat_mode,
-                    parsed.feat_exists,
-                    parsed.alpha,
-                    parsed.beta,
-                    parsed.gmin,
-                    parsed.gmax,
-                    parsed.use_tanh,
-                    parsed.v_candidates_len,
-                    parsed.feat0,
-                    parsed.path_w,
-                    parsed.factor,
-                    parsed.current_v
-                ).unwrap();
-                (self.print_fn)(&extra);
-            } else {
-                (self.print_fn)(&format!("[features-info] {s}"));
+            if print_user_monitor {
+                for (key, val) in client.user_monitor.iter() {
+                    if matches!(key.as_ref(), "features-info" | "tpe-info" | "tpe-trials") {
+                        continue;
+                    }
+                    to_print.push(format!("[{}] {}", key, val));
+                }
+            }
+
+            if let Some(u) = client.user_monitor.remove("features-info") {
+                if let UserStatsValue::String(s) = u.value() {
+                    if let Some(parsed) = parse_features_info(&s) {
+                        let mut extra = String::new();
+                        use std::fmt::Write as _;
+                        write!(
+                            extra,
+                            "[features-info] enabled={} active={} mode={} exists={} α={:.2} β={:.2} g=[{:.2},{:.2}] tanh={} v_cands={} feat0={:.3} path_w={:.3} factor={:.3} v={}",
+                            parsed.enabled, parsed.active, parsed.feat_mode, parsed.feat_exists,
+                            parsed.alpha, parsed.beta, parsed.gmin, parsed.gmax, parsed.use_tanh,
+                            parsed.v_candidates_len, parsed.feat0, parsed.path_w, parsed.factor,
+                            parsed.current_v
+                        ).unwrap();
+                        to_print.push(extra);
+                    } else {
+                        to_print.push(format!("[features-info] {}", s));
+                    }
+                }
+            }
+
+            if let Some(u) = client.user_monitor.remove("tpe-info") {
+                if let UserStatsValue::String(s) = u.value() {
+                    if let Some(parsed) = parse_tpe_info(&s) {
+                        let mut extra = String::new();
+                        use std::fmt::Write as _;
+                        write!(
+                            extra,
+                            "[tpe-info] ΔEdges={:.1} Coverage={} trials={} corpus={} α={:.2} ‖v‖={:.2} bw={:.2} γ={:.2} samples={} period={} v={}",
+                            parsed.reward, parsed.cov, parsed.trials, parsed.corpus,
+                            parsed.alpha, parsed.v_norm, parsed.bw, parsed.gamma,
+                            parsed.samples, parsed.period, parsed.vec
+                        ).unwrap();
+                        to_print.push(extra);
+                    } else {
+                        to_print.push(format!("[tpe-info] {}", s));
+                    }
+                }
+            }
+
+            if let Some(u) = client.user_monitor.remove("tpe-trials") {
+                if let UserStatsValue::String(s) = u.value() {
+                    for l in s.lines() {
+                        to_print.push(l.to_string());
+                    }
+                }
             }
         }
 
-        if let Some(s) = tpe_raw {
-            if let Some(parsed) = parse_tpe_info(&s) {
-                let mut extra = String::new();
-                    write!(
-                        extra,
-                        "[tpe-info] ΔEdges={:.1} Coverage={} trials={} corpus={} α={:.2} ‖v‖={:.2} bw={:.2} γ={:.2} samples={} period={} v={}",
-                        parsed.reward,   // ΔEdges
-                        parsed.cov,      // Coverage
-                        parsed.trials,   // trials
-                        parsed.corpus,   // corpus
-                        parsed.alpha,    // α
-                        parsed.v_norm,   // ‖v‖
-                        parsed.bw,       // bw
-                        parsed.gamma,    // γ
-                        parsed.samples,  // samples
-                        parsed.period,   // period
-                        parsed.vec        // v
-                    ).unwrap();
-                (self.print_fn)(&extra);
-            } else {
-                (self.print_fn)(&format!("[tpe-info] {s}"));
-            }
+        for l in to_print {
+            (self.print_fn)(&l);
         }
     }
 }

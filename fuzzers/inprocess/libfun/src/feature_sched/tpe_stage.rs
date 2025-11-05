@@ -58,32 +58,51 @@ where
             return Ok(());
         }
 
-        // init weight_vec = [alpha, w_1, ..., w_dim]
-        {
-            let params = get_factor_params(state);
-            let cur9 = get_current_weight_vec(state);
-            let v = if cur9.is_empty() {
-                    get_v_candidates(state)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| {
-                        let mut t = vec![params.alpha];
-                        t.extend(std::iter::repeat(1.0/8f64.sqrt()).take(8));
-                        t
-                    })
-            } else { cur9 };
-            self.opt.init_vec_if_empty(&v);
-        }
-
         // calculate reward: ΔCorpus
         // let cur_corpus = state.corpus().count();
         // let reward = self.opt.take_reward_from_corpus(cur_corpus).unwrap_or(0.0);
         // calculate reward: ΔEdges
-        let (cur_cov, cov_len) = if let Some(meta) =
+        let (cur_cov, _cov_len) = if let Some(meta) =
             state.named_metadata_map().get::<MapFeedbackMetadata<u8>>(&self.edges_name)
         {
             (meta.num_covered_map_indexes, meta.history_map.len())
         } else { (0, 0) };
+
+        // bootstrap TPE
+        if self.opt.is_first_window() {
+            if !self.opt.has_last_vec() {
+                let params = get_factor_params(state);
+                let cur9 = get_current_weight_vec(state);
+                let v = if cur9.is_empty() {
+                    get_v_candidates(state)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| {
+                            let mut t = vec![params.alpha];
+                            t.extend(std::iter::repeat(1.0 / 8f64.sqrt()).take(8));
+                            t
+                        })
+                } else {
+                    cur9
+                };
+                self.opt.set_last_vec(&v);
+            }
+
+            let last = self.opt.last_vec();
+            if last.len() >= 9 {
+                let mut p = get_factor_params(state);
+                p.alpha = last[0].clamp(0.0, 1.0);
+                set_factor_params(state, p);
+                apply_v_to_features(state, &last[1..9])?;
+            }
+
+            self.opt.set_last_cov(cur_cov);
+            self.opt.advance_window();
+            self.opt.persist_to_meta(state);
+            self.opt.finish_first_window();
+
+            return Ok(());
+        }
 
         let reward = self.opt
             .take_reward_from_coverage(cur_cov)
@@ -110,6 +129,21 @@ where
         self.opt.set_last_cov(cur_cov);
         // store to metadata
         self.opt.persist_to_meta(state);
+
+        {
+            let trials_text = self.opt.snapshot_trials_text();
+            _mgr.fire(
+                state,
+                Event::UpdateUserStats {
+                    name: "tpe-trials".into(),
+                    value: UserStats::new(
+                        UserStatsValue::String(trials_text.into()),
+                        AggregatorOps::None,
+                    ),
+                    phantom: core::marker::PhantomData,
+                },
+            )?;
+        }
 
         // message monitor callback
         {

@@ -605,11 +605,7 @@ fn fuzz(
 
     // The order of the stages matter!
     // let mut stages = tuple_list!(calibration, tracing, i2s, power);
-    let feat_stage = FeaturesAccountingStage {
-        // map_name: "sancov",
-        handle: sancov_handle,
-        _p: core::marker::PhantomData,
-    };
+    let feat_stage = FeaturesAccountingStage::new(sancov_handle.clone());
 
     // build TPE stage（period from CLI -> get_tpe_period())
     let edges_name = "edges".to_string();
