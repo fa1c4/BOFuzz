@@ -31,10 +31,90 @@ enum FeatsJson {
 
 const ATTR_ORDER: [&str; 8] = ["imme", "strc", "mem", "arith", "indeg", "offsp", "btw", "depth"];
 
+const DEFAULT_PRIOR_8: [usize; 8] = [6, 0, 5, 1, 2, 3, 4, 7];
+
+fn normalize_prior_order(mut raw: Vec<usize>, d: usize) -> Option<Vec<usize>> {
+    if raw.is_empty() { return None; }
+    let zero_based = raw.iter().all(|&x| x < d);
+    let one_based  = raw.iter().all(|&x| x >= 1 && x <= d);
+
+    if !zero_based && !one_based {
+        return None;
+    }
+    if one_based {
+        for x in &mut raw { *x -= 1; } // 1-based to 0-based
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(d);
+    let mut ord = Vec::with_capacity(d);
+    for &idx in &raw {
+        if idx < d && seen.insert(idx) {
+            ord.push(idx);
+        }
+    }
+    
+    for i in 0..d {
+        if seen.insert(i) {
+            ord.push(i);
+        }
+    }
+    
+    ord.truncate(d);
+    Some(ord)
+}
+
+fn load_prior_order_from(path: &Path, d: usize) -> Option<Vec<usize>> {
+    let mut f = File::open(path).ok()?;
+    let mut s = String::new();
+    f.read_to_string(&mut s).ok()?;
+    let raw: Vec<usize> = serde_json::from_str(&s).ok()?;
+    normalize_prior_order(raw, d)
+}
+
+fn one_hot(d: usize, idx: usize) -> Vec<f64> {
+    let mut v = vec![0.0; d];
+    if idx < d { v[idx] = 1.0; }
+    v
+}
+
+fn default_candidates_with_order(d: usize, order: &[usize]) -> Vec<Vec<f64>> {
+    let mut res = Vec::with_capacity(d + 1);
+    for &idx in order.iter().take(d) {
+        res.push(one_hot(d, idx));
+    }
+    res.push(uniform_vec(d));
+    res
+}
+
 fn ensure_v_candidates_for<S: HasMetadata>(state: &mut S, features_map_path: &Path) {
     if !get_v_candidates(state).is_empty() { return; }
 
     let dims = ATTR_ORDER.len(); // default as 8
+
+    let prior_order: Vec<usize> = match derive_dir_and_target(features_map_path) {
+        Some((dir, tgt)) => {
+            let pri_path = dir.join(format!("{}_prior_order.json", tgt));
+            match load_prior_order_from(&pri_path, dims) {
+                Some(v) => {
+                    eprintln!("Reading prior order file: {}", pri_path.display());
+                    eprintln!("Prior Order: {:?}", v);
+                    v
+                }
+                None => {
+                    eprintln!(
+                        "No valid prior order at {}, using DEFAULT_PRIOR_8.",
+                        pri_path.display()
+                    );
+                    DEFAULT_PRIOR_8.to_vec()
+                }
+            }
+        }
+        None => {
+            eprintln!("Cannot derive prior-order path, using DEFAULT_PRIOR_8.");
+            DEFAULT_PRIOR_8.to_vec()
+        }
+    };
+
     let cands8: Vec<Vec<f64>> = match derive_dir_and_target(features_map_path) {
         Some((dir, tgt)) => {
             let cand_path = dir.join(format!("{}_v_candidates.json", tgt));
@@ -48,7 +128,7 @@ fn ensure_v_candidates_for<S: HasMetadata>(state: &mut S, features_map_path: &Pa
                         "No v-candidates file provided or empty ({}), using defaults.",
                         cand_path.display()
                     );
-                    default_candidates(dims)
+                    default_candidates_with_order(dims, &prior_order)
                 }
             }
         }
@@ -57,7 +137,7 @@ fn ensure_v_candidates_for<S: HasMetadata>(state: &mut S, features_map_path: &Pa
                 "Cannot derive v-candidates path from {}, using defaults.",
                 features_map_path.display()
             );
-            default_candidates(dims)
+            default_candidates_with_order(dims, &prior_order)
         }
     };
 
