@@ -157,6 +157,14 @@ impl TpeOptimizer {
 
     pub fn observe(&self, vec: &[f64], reward: f64) {
         let mut s = self.state.write().unwrap();
+        if let Some(last) = s.trials.last_mut() {
+            // do not push same vec, only update reward 
+            if vecn_eq(&last.vec, vec, 1e-6) {
+                if reward > last.reward { last.reward = reward; }
+                return;
+            }
+        }
+
         s.trials.push(Trial { vec: vec.to_vec(), reward });
 
         const MAX_TRIALS: usize = 1024;
