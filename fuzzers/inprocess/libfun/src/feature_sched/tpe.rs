@@ -429,7 +429,19 @@ impl TpeOptimizer {
         trials.sort_by(|a, b| a.reward.partial_cmp(&b.reward).unwrap());
         let n = trials.len();
         let k = ((n as f64 * self.params.gamma).ceil() as usize).clamp(1, n);
-        let y_star = trials[n - k].reward;
+        let mut y_star = trials[n - k].reward;
+
+        if y_star <= 0.0 {
+            if let Some(min_pos) = trials.iter()
+                .filter(|t| t.reward > 0.0)
+                .map(|t| t.reward)
+                .min_by(|a, b| a.partial_cmp(b).unwrap())
+            {
+                y_star = min_pos;
+            } else {
+                return None;
+            }
+        }
 
         let mut lset = Vec::new();
         let mut gset = Vec::new();
