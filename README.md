@@ -2,13 +2,21 @@
 FunAFL (v2.0+) is based on LibAFL 0.15.0 version. 
 
 ## Setup
-Dependencies: LLVM-15+, Rust
+Dependencies: LLVM-15+, rustc 1.89.0, cargo 1.89.0
+```shell
+sudo apt install rustup
+# or
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+# then install rust environment
+rustup toolchain install 1.89.0
+```
 
 ## Test
 ```shell
 cd fuzzers/inprocess/libfun
 
-cargo clean && cargo build --profile release-libfun --features no_link_main                                                                         ✔ 
+cargo clean && cargo build --profile release-libfun --features no_link_main
 clang -c stub_rt.c -o stub_rt.o
 ar r ./stub_rt.a stub_rt.o
 ```
@@ -16,6 +24,7 @@ ar r ./stub_rt.a stub_rt.o
 build and run the example with funafl
 ```shell
 cd ../../../example
+chmod +x zlib_uncompress_demo.sh
 ./zlib_uncompress_demo.sh
 ```
 
