@@ -5,6 +5,9 @@ fuzzers/inprocess/**
 /example/work/
 /eval/results/
 
+# ignore plans
+plans/
+
 # original ignore
 target
 target-bin
