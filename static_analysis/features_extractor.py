@@ -76,14 +76,21 @@ TRIVIAL_IMMEDIATE_VALUES = {
     255, 256, 512, 1024,
 }
 
-# ---- Const-data segments ----
-CONST_DATA_SEGMENT_NAMES = {
+# ---- Const-data segments (normalized to lowercase at definition) ----
+CONST_DATA_SEGMENT_NAMES = {x.lower() for x in {
     ".rodata",
     ".rdata",
     "__const",
     "__cstring",
     ".const",
     ".data.rel.ro",
+}}
+
+# ---- String detection ----
+STRICT_STRING_DETECTION = True
+
+STRING_SEGMENT_NAMES = {
+    "__cstring",
 }
 
 # ---- Normalization groups ----
@@ -96,6 +103,20 @@ LOG1P_FEATURES = {
 
 RAW_BINARY_FEATURES = {
     "loop_boundary_flag",
+}
+
+# ---- Instruction mnemonic sets ----
+STRING_MEMORY_MNEMS = {
+    "movs", "movsb", "movsw", "movsd", "movsq",
+    "stos", "stosb", "stosw", "stosd", "stosq",
+    "lods", "lodsb", "lodsw", "lodsd", "lodsq",
+    "cmps", "cmpsb", "cmpsw", "cmpsd", "cmpsq",
+    "scas", "scasb", "scasw", "scasd", "scasq",
+}
+
+STRING_CMP_MNEMS = {
+    "cmps", "cmpsb", "cmpsw", "cmpsd", "cmpsq",
+    "scas", "scasb", "scasw", "scasd", "scasq",
 }
 
 # ======================= CORE UTILITIES =======================
@@ -139,6 +160,27 @@ def finite_or_zero(x):
     if math.isnan(x) or math.isinf(x):
         return 0.0
     return float(x)
+
+def get_arch_bits():
+    try:
+        inf = idaapi.get_inf_structure()
+        if inf.is_64bit():
+            return 64
+        if inf.is_32bit():
+            return 32
+    except Exception:
+        pass
+    return 64
+
+def to_signed_imm(v, bits=None):
+    if bits is None:
+        bits = get_arch_bits()
+    mask = (1 << bits) - 1
+    v = int(v) & mask
+    sign = 1 << (bits - 1)
+    if v & sign:
+        return v - (1 << bits)
+    return v
 
 # ======================= STRING TABLE =======================
 def get_all_ida_strings():
@@ -184,6 +226,20 @@ def get_string_at_address(addr):
     except Exception:
         return None
 
+def looks_like_printable_c_string(addr, max_len=256):
+    data = idc.get_bytes(addr, max_len)
+    if not data:
+        return False
+    nul = data.find(b"\x00")
+    if nul < 2:
+        return False
+    s = data[:nul]
+    printable = 0
+    for c in s:
+        if c in (9, 10, 13) or 32 <= c <= 126:
+            printable += 1
+    return float(printable) / float(len(s)) >= 0.85
+
 # ======================= OPERAND / REFERENCE CLASSIFICATION =======================
 def get_segment_name(ea):
     seg = idaapi.getseg(ea)
@@ -191,51 +247,95 @@ def get_segment_name(ea):
         return (idaapi.get_segm_name(seg) or "").strip()
     return ""
 
+def canonical_seg_name(addr):
+    name = get_segment_name(addr)
+    return (name or "").lower()
+
 def is_text_addr(addr):
-    name = get_segment_name(addr).lower()
+    name = canonical_seg_name(addr)
     return name in ('.text', 'text', 'code', '__text')
 
 def is_const_data_addr(addr):
-    name = get_segment_name(addr)
-    return name in CONST_DATA_SEGMENT_NAMES
+    if addr is None or addr in (0, idc.BADADDR):
+        return False
+    seg_name = canonical_seg_name(addr)
+    return seg_name in CONST_DATA_SEGMENT_NAMES
 
 def is_string_addr(addr, string_addrs):
+    if addr is None or addr in (0, idc.BADADDR):
+        return False
+
     if addr in string_addrs:
         return True
-    s = get_string_at_address(addr)
-    return s is not None and len(s) >= 2
+
+    try:
+        st = idc.get_str_type(addr)
+        if st != -1:
+            return True
+    except Exception:
+        pass
+
+    seg_name = canonical_seg_name(addr)
+    if seg_name in STRING_SEGMENT_NAMES:
+        return looks_like_printable_c_string(addr)
+
+    if STRICT_STRING_DETECTION:
+        return False
+
+    return get_string_at_address(addr) is not None
 
 def classify_operand_value(value, string_addrs):
     """
     Return one of:
       "string_ref", "const_data_ref", "code_ref",
-      "numeric_immediate", "unknown"
+      "address_ref", "numeric_immediate", "unknown"
     """
-    if value is None or value == 0:
-        return "numeric_immediate"
-    if value == idc.BADADDR:
+    if value is None or value in (idc.BADADDR,):
         return "unknown"
-    seg = idaapi.getseg(value)
-    if seg is None:
+
+    if value == 0:
         return "numeric_immediate"
+
+    seg = idaapi.getseg(value)
+    if not seg:
+        return "numeric_immediate"
+
     if is_string_addr(value, string_addrs):
         return "string_ref"
+
     if is_const_data_addr(value):
         return "const_data_ref"
-    if is_text_addr(value):
+
+    if is_plausible_code_addr(value):
         return "code_ref"
-    return "numeric_immediate"
+
+    return "address_ref"
 
 def is_trivial_immediate(v):
-    if v in TRIVIAL_IMMEDIATE_VALUES:
-        return True
-    if -256 <= v < 0:
-        return True
-    return False
+    try:
+        uv = int(v)
+        sv = to_signed_imm(uv)
+
+        if uv in TRIVIAL_IMMEDIATE_VALUES:
+            return True
+
+        if sv in TRIVIAL_IMMEDIATE_VALUES:
+            return True
+
+        if -256 <= sv < 0:
+            return True
+
+        return False
+    except Exception:
+        return False
 
 # ======================= INSTRUCTION CLASSIFIERS =======================
 def is_cmp_inst(mnem):
     if mnem in {"cmp", "test"}:
+        return True
+    if mnem in {"cmpxchg", "cmpxchg8b", "cmpxchg16b"}:
+        return True
+    if mnem in STRING_CMP_MNEMS:
         return True
     if mnem.startswith("ucomis"):
         return True
@@ -328,13 +428,18 @@ def is_arith_bitwise_inst(mnem):
 
 def is_mem_inst(ea, mnem):
     """
-    True if instruction has an explicit memory operand.
-    lea and call are excluded. Counts at most once per instruction.
+    True if instruction has an explicit memory operand or is a string memory op.
+    lea, call, push/pop register do not count. push/pop [mem] counts via operand check.
     """
+    if is_call_inst(mnem):
+        return False
+
     if mnem == "lea":
         return False
-    if mnem in {"call", "callq"} or mnem.startswith("call"):
-        return False
+
+    if mnem in STRING_MEMORY_MNEMS:
+        return True
+
     try:
         for i in range(8):
             t = idc.get_operand_type(ea, i)
@@ -358,6 +463,7 @@ _REF_OPERAND_TYPES = {idaapi.o_imm, idaapi.o_mem, idaapi.o_displ, idaapi.o_near,
 def extract_instruction_features(ea, string_addrs):
     """
     Return dict with instruction-level feature increments for a single instruction.
+    Uses DataRefsFrom as primary source for string/const-data refs, operand value as fallback.
     """
     res = {name: 0.0 for name in INSTRUCTION_ATTRS}
     res["bb_instruction_count"] = 1.0
@@ -377,6 +483,25 @@ def extract_instruction_features(ea, string_addrs):
     if is_call_inst(mnem):
         res["call_count"] += 1.0
 
+    # Primary: DataRefsFrom for string/const-data references (dedup per target)
+    seen_string_refs = set()
+    seen_const_refs = set()
+    try:
+        for ref in idautils.DataRefsFrom(ea):
+            if ref in (None, idc.BADADDR):
+                continue
+            if is_string_addr(ref, string_addrs):
+                if ref not in seen_string_refs:
+                    res["string_literal_ref_count"] += 1.0
+                    seen_string_refs.add(ref)
+            elif is_const_data_addr(ref):
+                if ref not in seen_const_refs:
+                    res["const_data_ref_count"] += 1.0
+                    seen_const_refs.add(ref)
+    except Exception:
+        pass
+
+    # Fallback: operand values for immediates, string/const refs not caught by DataRefsFrom
     try:
         for i in range(6):
             t = idc.get_operand_type(ea, i)
@@ -389,20 +514,29 @@ def extract_instruction_features(ea, string_addrs):
             if t == idaapi.o_imm:
                 cls = classify_operand_value(v, string_addrs)
                 if cls == "string_ref":
-                    res["string_literal_ref_count"] += 1.0
+                    if v not in seen_string_refs:
+                        res["string_literal_ref_count"] += 1.0
+                        seen_string_refs.add(v)
                 elif cls == "const_data_ref":
-                    res["const_data_ref_count"] += 1.0
+                    if v not in seen_const_refs:
+                        res["const_data_ref_count"] += 1.0
+                        seen_const_refs.add(v)
                 elif cls == "numeric_immediate":
                     if FILTER_TRIVIAL_IMMEDIATES and is_trivial_immediate(v):
                         pass
                     else:
                         res["numeric_immediate_count"] += 1.0
+                # code_ref / address_ref / unknown -> do nothing for numeric counting
             else:
                 if v is not None and v != 0 and v != idc.BADADDR:
                     if is_string_addr(v, string_addrs):
-                        res["string_literal_ref_count"] += 1.0
+                        if v not in seen_string_refs:
+                            res["string_literal_ref_count"] += 1.0
+                            seen_string_refs.add(v)
                     elif is_const_data_addr(v):
-                        res["const_data_ref_count"] += 1.0
+                        if v not in seen_const_refs:
+                            res["const_data_ref_count"] += 1.0
+                            seen_const_refs.add(v)
     except Exception:
         pass
 
@@ -662,9 +796,19 @@ def build_function_call_graph():
         cur = ea
         while cur < end and cur != idc.BADADDR:
             m = get_base_mnemonic(cur)
-            if m == 'call':
-                tgt = idc.get_operand_value(cur, 0)
-                if tgt != idc.BADADDR:
+            if is_call_inst(m):
+                targets = set()
+                try:
+                    for r in idautils.CodeRefsFrom(cur, False):
+                        if r not in (None, idc.BADADDR):
+                            targets.add(r)
+                except Exception:
+                    pass
+                if not targets:
+                    tgt = idc.get_operand_value(cur, 0)
+                    if tgt not in (None, idc.BADADDR):
+                        targets.add(tgt)
+                for tgt in targets:
                     tgt_fn = idaapi.get_func(tgt)
                     if tgt_fn and function_filter(tgt_fn.start_ea):
                         call_graph[ea].add(tgt_fn.start_ea)
@@ -724,9 +868,63 @@ def build_target_cfg_and_features(target_funcs):
 
     return CFG, blocks, func_of_bb
 
+# ======================= ITERATIVE SCC (Kosaraju) =======================
+def compute_sccs_iterative(adj, nodes):
+    """
+    Iterative Kosaraju SCC. Returns list of sets. No recursion.
+    """
+    nodes = list(nodes)
+    node_set = set(nodes)
+
+    radj = {n: set() for n in nodes}
+    for u in nodes:
+        for v in adj.get(u, ()):
+            if v in node_set:
+                radj.setdefault(v, set()).add(u)
+
+    visited = set()
+    order = []
+
+    for start in nodes:
+        if start in visited:
+            continue
+        stack = [(start, False)]
+        while stack:
+            n, expanded = stack.pop()
+            if expanded:
+                order.append(n)
+                continue
+            if n in visited:
+                continue
+            visited.add(n)
+            stack.append((n, True))
+            for v in adj.get(n, ()):
+                if v in node_set and v not in visited:
+                    stack.append((v, False))
+
+    visited.clear()
+    sccs = []
+
+    for start in reversed(order):
+        if start in visited:
+            continue
+        comp = set()
+        stack = [start]
+        visited.add(start)
+        while stack:
+            n = stack.pop()
+            comp.add(n)
+            for v in radj.get(n, ()):
+                if v not in visited:
+                    visited.add(v)
+                    stack.append(v)
+        sccs.append(comp)
+
+    return sccs
+
 # ======================= STRUCTURAL FEATURES =======================
 
-# ---- 8.1 CFG degree ----
+# ---- CFG degree ----
 def compute_cfg_degree_features(CFG, blocks):
     preds = defaultdict(int)
     for u, outs in CFG.items():
@@ -738,50 +936,8 @@ def compute_cfg_degree_features(CFG, blocks):
         b.set_raw_attr("cfg_out_degree", float(len(CFG.get(bb_ea, set()))))
         b.set_raw_attr("cfg_in_degree", float(preds.get(bb_ea, 0)))
 
-# ---- 8.2 Static descendant / ancestor (SCC condensation) ----
-def _tarjan_scc(adj, nodes):
-    """Tarjan's SCC algorithm. Returns list of SCCs (each SCC is a frozenset of node ids)."""
-    index_counter = [0]
-    stack = []
-    on_stack = set()
-    index = {}
-    lowlink = {}
-    result = []
-
-    def strongconnect(v):
-        index[v] = index_counter[0]
-        lowlink[v] = index_counter[0]
-        index_counter[0] += 1
-        stack.append(v)
-        on_stack.add(v)
-
-        for w in adj.get(v, ()):
-            if w not in nodes:
-                continue
-            if w not in index:
-                strongconnect(w)
-                lowlink[v] = min(lowlink[v], lowlink[w])
-            elif w in on_stack:
-                lowlink[v] = min(lowlink[v], index[w])
-
-        if lowlink[v] == index[v]:
-            component = set()
-            while True:
-                w = stack.pop()
-                on_stack.discard(w)
-                component.add(w)
-                if w == v:
-                    break
-            result.append(frozenset(component))
-
-    for v in nodes:
-        if v not in index:
-            strongconnect(v)
-
-    return result
-
+# ---- Static descendant / ancestor (SCC condensation) ----
 def _compute_reachable_sizes_on_dag(dag, scc_sizes, scc_order):
-    """Given a DAG (scc_id -> set of successor scc_ids) and sizes, compute total reachable node count from each SCC."""
     reachable = {}
     for scc_id in reversed(scc_order):
         visited_sccs = set()
@@ -797,7 +953,7 @@ def _compute_reachable_sizes_on_dag(dag, scc_sizes, scc_order):
                     visited_sccs.add(y)
                     dq.append(y)
         total = sum(scc_sizes[s] for s in visited_sccs)
-        total += scc_sizes[scc_id] - 1  # same SCC minus self
+        total += scc_sizes[scc_id] - 1
         reachable[scc_id] = total
     return reachable
 
@@ -806,7 +962,7 @@ def compute_static_reachability_features(CFG, blocks):
     if not nodes:
         return
 
-    sccs = _tarjan_scc(CFG, nodes)
+    sccs = compute_sccs_iterative(CFG, nodes)
 
     node_to_scc = {}
     scc_sizes = {}
@@ -815,7 +971,6 @@ def compute_static_reachability_features(CFG, blocks):
         for n in scc:
             node_to_scc[n] = idx
 
-    # Build SCC DAG (forward)
     scc_dag_fwd = defaultdict(set)
     for u in nodes:
         u_scc = node_to_scc[u]
@@ -825,7 +980,6 @@ def compute_static_reachability_features(CFG, blocks):
                 if u_scc != v_scc:
                     scc_dag_fwd[u_scc].add(v_scc)
 
-    # Build SCC DAG (reverse)
     scc_dag_rev = defaultdict(set)
     for u_scc, succs in scc_dag_fwd.items():
         for v_scc in succs:
@@ -842,7 +996,7 @@ def compute_static_reachability_features(CFG, blocks):
             b.set_raw_attr("static_descendant_count", float(descendant_reachable.get(scc_id, 0)))
             b.set_raw_attr("static_ancestor_count", float(ancestor_reachable.get(scc_id, 0)))
 
-# ---- 8.3 Entry depth ----
+# ---- Entry depth ----
 def compute_depth_attribute(CFG, blocks, func_of_bb, call_graph, seeds):
     func_depth = defaultdict(lambda: 0.0)
     INF = 1 << 30
@@ -898,7 +1052,11 @@ def compute_depth_attribute(CFG, blocks, func_of_bb, call_graph, seeds):
         d_intra = float(intra_depth.get(bb_ea, 0))
         b.set_raw_attr("entry_depth", d_func + d_intra)
 
-# ---- 8.4 Loop features (natural loop + SCC fallback) ----
+# ---- Loop features (natural loop with same-header merge + SCC fallback) ----
+def _add_loop_role(roles_debug, node, role):
+    if role not in roles_debug[node]:
+        roles_debug[node].append(role)
+
 def compute_loop_features(CFG, blocks, func_of_bb):
     func_to_bbs = defaultdict(set)
     for bb_ea, f_ea in func_of_bb.items():
@@ -920,7 +1078,6 @@ def compute_loop_features(CFG, blocks, func_of_bb):
                     func_succs[u].add(v)
                     func_preds[v].add(u)
 
-        # Find entry BB
         entry_candidates = [b for b in func_bbs if not func_preds[b]]
         entry_bb = entry_candidates[0] if entry_candidates else min(func_bbs)
 
@@ -954,7 +1111,7 @@ def compute_loop_features(CFG, blocks, func_of_bb):
                     back_edges.append((u, v))
 
         # For each back edge, recover natural loop
-        natural_loops = []
+        raw_loops = []
         for latch, header in back_edges:
             loop_nodes = {header}
             if latch != header:
@@ -966,34 +1123,40 @@ def compute_loop_features(CFG, blocks, func_of_bb):
                         if pred not in loop_nodes and pred in func_bbs:
                             loop_nodes.add(pred)
                             work.append(pred)
-            natural_loops.append((header, latch, frozenset(loop_nodes)))
+            raw_loops.append((header, latch, frozenset(loop_nodes)))
 
-        # Accumulate nesting depth
-        for header, latch, loop_nodes in natural_loops:
+        # Merge same-header natural loops
+        loops_by_header = {}
+        latches_by_header = defaultdict(set)
+        for header, latch, loop_nodes in raw_loops:
+            if header not in loops_by_header:
+                loops_by_header[header] = set()
+            loops_by_header[header].update(loop_nodes)
+            latches_by_header[header].add(latch)
+
+        for header, loop_nodes in loops_by_header.items():
             for n in loop_nodes:
                 loop_nesting[n] += 1
 
             loop_boundary[header] = 1.0
-            if "header" not in loop_roles_debug[header]:
-                loop_roles_debug[header].append("header")
+            _add_loop_role(loop_roles_debug, header, "header")
+            _add_loop_role(loop_roles_debug, header, "backedge_target")
 
-            loop_boundary[latch] = 1.0
-            if "latch" not in loop_roles_debug[latch]:
-                loop_roles_debug[latch].append("latch")
+            for latch in latches_by_header[header]:
+                loop_boundary[latch] = 1.0
+                _add_loop_role(loop_roles_debug, latch, "latch")
+                _add_loop_role(loop_roles_debug, latch, "backedge_source")
 
-            # Loop exit: edges from loop to non-loop
             for n in loop_nodes:
                 for s in func_succs.get(n, ()):
                     if s not in loop_nodes:
                         loop_boundary[n] = 1.0
-                        if "exit_source" not in loop_roles_debug[n]:
-                            loop_roles_debug[n].append("exit_source")
                         loop_boundary[s] = 1.0
-                        if "exit_target" not in loop_roles_debug[s]:
-                            loop_roles_debug[s].append("exit_target")
+                        _add_loop_role(loop_roles_debug, n, "exit_source")
+                        _add_loop_role(loop_roles_debug, s, "exit_target")
 
-        # SCC fallback: if function-local SCC has size > 1 or self-loop, treat as loop
-        func_sccs = _tarjan_scc(func_succs, func_bbs)
+        # SCC fallback
+        func_sccs = compute_sccs_iterative(func_succs, func_bbs)
         for scc in func_sccs:
             is_loop_scc = False
             if len(scc) > 1:
@@ -1007,16 +1170,19 @@ def compute_loop_features(CFG, blocks, func_of_bb):
                 continue
 
             for n in scc:
-                if loop_nesting[n] == 0:
-                    loop_nesting[n] = max(loop_nesting[n], 1)
+                loop_nesting[n] = max(loop_nesting[n], 1)
+
+                for p in func_preds.get(n, ()):
+                    if p not in scc:
+                        loop_boundary[n] = 1.0
+                        _add_loop_role(loop_roles_debug, n, "scc_entry")
+
                 for s in func_succs.get(n, ()):
                     if s not in scc:
                         loop_boundary[n] = 1.0
                         loop_boundary[s] = 1.0
-                for p in func_preds.get(n, ()):
-                    if p not in scc:
-                        loop_boundary[n] = 1.0
-                        loop_boundary[p] = 1.0
+                        _add_loop_role(loop_roles_debug, n, "scc_exit_source")
+                        _add_loop_role(loop_roles_debug, s, "scc_exit_target")
 
     for bb_ea, b in blocks.items():
         b.set_raw_attr("loop_nesting_depth", float(loop_nesting.get(bb_ea, 0)))
@@ -1024,7 +1190,7 @@ def compute_loop_features(CFG, blocks, func_of_bb):
         if bb_ea in loop_roles_debug:
             b.debug["loop_roles"] = loop_roles_debug[bb_ea]
 
-# ---- 8.5 Centrality (betweenness, Brandes) ----
+# ---- Centrality (betweenness, Brandes with sampled scaling) ----
 def compute_centrality_feature(CFG, blocks):
     nodes = list(blocks.keys())
     N = len(nodes)
@@ -1069,11 +1235,18 @@ def compute_centrality_feature(CFG, blocks):
             if w != s:
                 btw_acc[w] += delta[w]
 
-    norm = (len(sample_nodes) - 1) * (N - 1) if N > 1 else 1.0
+    sample_size = len(sample_nodes)
+    if sample_size > 0 and sample_size < N:
+        scale = float(N) / float(sample_size)
+    else:
+        scale = 1.0
+
+    norm = (sample_size - 1) * (N - 1) if N > 1 else 1.0
     if norm <= 0:
         norm = 1.0
     for bb_ea in nodes:
-        blocks[bb_ea].set_raw_attr("centrality", float(btw_acc.get(bb_ea, 0.0) / norm))
+        raw = btw_acc.get(bb_ea, 0.0) * scale
+        blocks[bb_ea].set_raw_attr("centrality", float(raw / norm))
 
 # ======================= FEATURE MODE =======================
 def apply_feature_mode(blocks, feature="both"):
@@ -1162,7 +1335,18 @@ def validate_features(pcs, CFG, blocks):
     if len(ATTR_NAMES) != 16:
         errors.append(f"ATTR_NAMES length is {len(ATTR_NAMES)}, expected 16")
 
+    # Build predecessor map for in-degree validation
+    pred_count = defaultdict(int)
+    for u, outs in CFG.items():
+        for v in outs:
+            if v in blocks:
+                pred_count[v] += 1
+
     for bb_ea, b in blocks.items():
+        if set(b.raw_attrs.keys()) != set(ATTR_NAMES):
+            errors.append(f"BB {hex(bb_ea)}: raw_attrs keys mismatch")
+        if set(b.norm_attrs.keys()) != set(ATTR_NAMES):
+            errors.append(f"BB {hex(bb_ea)}: norm_attrs keys mismatch")
         for name in ATTR_NAMES:
             rv = b.get_raw_attr(name)
             nv = b.get_norm_attr(name)
@@ -1175,9 +1359,16 @@ def validate_features(pcs, CFG, blocks):
             errors.append(f"BB {hex(bb_ea)}: loop_boundary_flag is {lbf}")
         if b.get_raw_attr("loop_nesting_depth") < 0:
             errors.append(f"BB {hex(bb_ea)}: loop_nesting_depth is negative")
+        if b.get_raw_attr("static_descendant_count") < 0:
+            errors.append(f"BB {hex(bb_ea)}: static_descendant_count is negative")
+        if b.get_raw_attr("static_ancestor_count") < 0:
+            errors.append(f"BB {hex(bb_ea)}: static_ancestor_count is negative")
         expected_out = float(len(CFG.get(bb_ea, set())))
         if b.get_raw_attr("cfg_out_degree") != expected_out:
             errors.append(f"BB {hex(bb_ea)}: cfg_out_degree mismatch")
+        expected_in = float(pred_count.get(bb_ea, 0))
+        if b.get_raw_attr("cfg_in_degree") != expected_in:
+            errors.append(f"BB {hex(bb_ea)}: cfg_in_degree mismatch")
 
     if errors:
         for e in errors[:20]:
@@ -1204,6 +1395,25 @@ def validate_features(pcs, CFG, blocks):
         nz = len(vals) - zc
         print(f"{name:<30s} {mn:10.3f} {mx:10.3f} {mu:10.3f} {sd:10.3f} {zc:6d} {nz:7d}")
 
+def validate_exported_maps(attr_arrays, pcs):
+    if set(attr_arrays.keys()) != set(ATTR_NAMES):
+        raise RuntimeError("exported feature map keys do not match ATTR_NAMES")
+
+    for name in ATTR_NAMES:
+        arr = attr_arrays.get(name)
+        if arr is None:
+            raise RuntimeError("missing feature array: %s" % name)
+
+        if len(arr) != len(pcs):
+            raise RuntimeError(
+                "feature array length mismatch for %s: got %d, expected %d"
+                % (name, len(arr), len(pcs))
+            )
+
+        for x in arr:
+            if not math.isfinite(float(x)):
+                raise RuntimeError("non-finite value in feature array: %s" % name)
+
 # ======================= EXPORT =======================
 def build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges=None):
     bin_path = ida_nalt.get_input_file_path()
@@ -1227,6 +1437,7 @@ def build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges=No
                 "func": None,
                 "attrs_raw": None,
                 "attrs_norm": None,
+                "debug": None,
                 "weight": float(EPS_NON_TARGET),
                 "note": "no_bb"
             })
@@ -1236,8 +1447,6 @@ def build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges=No
         if start in target_bb_set:
             b = blocks[start]
             w = directional_weight(b.to_attr_list_norm())
-            if w == 0.0:
-                w = EPS_NON_TARGET
             fmap.append(float(w))
             dbg.append({
                 "index": idx,
@@ -1246,7 +1455,8 @@ def build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges=No
                 "func": hex(b.func_ea),
                 "attrs_raw": dict(b.raw_attrs),
                 "attrs_norm": dict(b.norm_attrs),
-                "weight": float(w)
+                "debug": dict(getattr(b, "debug", {})),
+                "weight": float(w),
             })
         else:
             fmap.append(EPS_NON_TARGET)
@@ -1257,18 +1467,17 @@ def build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges=No
                 "func": None,
                 "attrs_raw": None,
                 "attrs_norm": None,
+                "debug": None,
                 "weight": float(EPS_NON_TARGET),
                 "note": "non_target"
             })
 
-    # Default weight map
     out_path = os.path.join(out_dir, f"{base}_features_map_default.json")
     with open(out_path, "w") as f:
         json.dump(fmap, f, indent=2)
     if VERBOSE:
         print(f"[+] Saved features_map_default -> {out_path}")
 
-    # Debug JSON
     dbg_path = os.path.join(out_dir, f"{base}_features_map.debug.json")
     dbg_payload = {
         "schema_version": FEATURE_SCHEMA_VERSION,
@@ -1309,8 +1518,6 @@ def build_and_save_features_map_for_u(pcs, blocks, func_of_bb, u, out_filename):
             b = blocks[start]
             zn = b.to_attr_list_norm()
             w = directional_weight(zn, u=u)
-            if w == 0.0:
-                w = EPS_NON_TARGET
             fmap.append(float(w))
         else:
             fmap.append(float(EPS_NON_TARGET))
@@ -1338,6 +1545,16 @@ def save_schema_json(out_dir, base):
         },
         "target_scope": "functions reachable from LLVMFuzzerTestOneInput",
         "architecture_support": "x86/x86_64 first-class",
+        "zero_policy": "target BB zeros are preserved; EPS_NON_TARGET is used only for no_bb and non_target",
+        "string_detection": "IDA Strings table, explicit IDA string type, and printable __cstring only",
+        "const_data_detection": "case-insensitive const-data segment matching; string refs take precedence",
+        "data_reference_source": "DataRefsFrom first, operand value fallback",
+        "numeric_immediate_policy": "filtered trivial immediates with signed-form handling; in-segment non-const addresses are not numeric immediates",
+        "memory_instruction_policy": "explicit memory operands and x86 string memory ops count; push/pop register, call, and lea do not count",
+        "cmp_instruction_policy": "cmp/test/comis/ucomis/pcmp/vpcmp/fcom/ftst/cmpxchg/cmps/scas count",
+        "loop_policy": "natural loops with same-header merge; SCC fallback marks SCC entry node, not outside predecessor",
+        "centrality_policy": "current Brandes-style heuristic normalization; sampled mode scaled by N/sample_size",
+        "scc_implementation": "iterative Kosaraju SCC; no recursive Tarjan",
         "notes": [
             "cmp_inst_count is separate from arith_bitwise_count",
             "mem_inst_count counts explicit memory-access instructions only",
@@ -1359,54 +1576,45 @@ def main():
     print(f"[+] Binary: {bin_path}")
     print(f"[+] Feature schema version: {FEATURE_SCHEMA_VERSION}, dims: {len(ATTR_NAMES)}")
 
-    # 1. Collect pcs
     pcs = collect_pcs_aligned_with_counters()
     print(f"[+] PCs collected (aligned with counters): {len(pcs)}")
 
-    # 2. Resolve seed entries
     seeds = resolve_seed_entries(pcs)
     seed_names = [idc.get_func_name(ea) or hex(ea) for ea in seeds]
     print(f"[+] Seed entries: {seed_names}")
 
-    # 3. Build function call graph
     call_g = build_function_call_graph()
 
-    # 4. Target-only function reachability
     target_funcs = reachable_from_seeds(call_g, seeds)
     print(f"[+] Target-only function count: {len(target_funcs)}")
 
-    # 5. Build target-only CFG and instruction-level features
     CFG, blocks, func_of_bb = build_target_cfg_and_features(target_funcs)
     print(f"[+] Target-only CFG: {len(blocks)} basic blocks, {sum(len(v) for v in CFG.values())} edges")
 
     if len(blocks) == 0:
         raise RuntimeError("Target-only CFG is empty. Check entry points/reachability or build symbols.")
 
-    # 6. Structural features
     print("[+] Computing CFG degree features ...")
     compute_cfg_degree_features(CFG, blocks)
 
-    print("[+] Computing static reachability (descendant/ancestor via SCC) ...")
+    print("[+] Computing static reachability (descendant/ancestor via iterative SCC) ...")
     compute_static_reachability_features(CFG, blocks)
 
     print("[+] Computing depth (from entry function) ...")
     compute_depth_attribute(CFG, blocks, func_of_bb, call_g, seeds)
 
-    print("[+] Computing loop features (natural loop + SCC fallback) ...")
+    print("[+] Computing loop features (natural loop with header merge + SCC fallback) ...")
     compute_loop_features(CFG, blocks, func_of_bb)
 
     print("[+] Computing centrality (betweenness) ...")
     compute_centrality_feature(CFG, blocks)
 
-    # 7. Feature mode
     feature = 'both'
     apply_feature_mode(blocks, feature=feature)
     print(f"[+] Feature mode: {feature}")
 
-    # 8. Normalize
     normalize_blocks(blocks)
 
-    # 9. APageRank (disabled by default)
     if USE_APAGERANK:
         if feature == "semantic":
             ap_attrs = INSTRUCTION_ATTRS
@@ -1421,19 +1629,15 @@ def main():
         apagerank_time_end = time.time()
         print(f"    APageRank Time: {apagerank_time_end - apagerank_time_start:.2f}s")
 
-    # 10. Reachable edge stats
+    validate_features(pcs, CFG, blocks)
+
     reachable_edges = count_reachable_edges(CFG, func_of_bb, target_funcs)
     if VERBOSE:
         print(f"[+] Reachable edges from entries: {reachable_edges}")
 
-    # 10.5. Validate
-    validate_features(pcs, CFG, blocks)
-
-    # 11. Export canonical feature maps, default map, debug, schema
     base = os.path.basename(bin_path)
     out_dir = os.path.dirname(bin_path) or os.getcwd()
 
-    # Per-feature one-hot maps
     attr_arrays = {}
     dim = len(ATTR_NAMES)
     for i, name in enumerate(ATTR_NAMES):
@@ -1443,17 +1647,16 @@ def main():
         fmap, _ = build_and_save_features_map_for_u(pcs, blocks, func_of_bb, u_one_hot, out_file)
         attr_arrays[name] = fmap
 
-    # Merged 16-key dict map
+    validate_exported_maps(attr_arrays, pcs)
+
     merged_path = os.path.join(out_dir, f"{base}_features_map.json")
     with open(merged_path, "w") as f:
         json.dump(attr_arrays, f, indent=2)
     if VERBOSE:
         print(f"[+] Saved merged 16-key features_map -> {merged_path}")
 
-    # Default weight map + debug JSON
     out_map, out_dbg = build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges)
 
-    # Schema JSON
     schema_path = save_schema_json(out_dir, base)
 
     time_end = time.time()
