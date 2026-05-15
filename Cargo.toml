@@ -122,7 +122,7 @@ typed-builder = "0.20.0" # Implement the builder pattern at compiletime
 uuid = { version = "1.10.0", features = ["serde", "v4"] }
 which = "6.0.3"
 windows = "0.59.0"
-z3 = "0.12.1"
+z3 = "0.20.0"
 
 
 [workspace.lints.rust]
