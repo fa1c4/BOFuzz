@@ -1,8 +1,8 @@
 /*
 feature_sched/stats.rs: define WeightStats
 */
-use serde::{Serialize, Deserialize};
 use libafl_bolts::SerdeAny;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
 pub struct WeightStats {
@@ -20,6 +20,10 @@ impl WeightStats {
     }
     #[inline]
     pub fn sigma(&self) -> f64 {
-        if self.n > 1 { (self.m2 / ((self.n - 1) as f64)).sqrt() } else { 1e-9 }
+        if self.n > 1 {
+            (self.m2 / ((self.n - 1) as f64)).sqrt()
+        } else {
+            1e-9
+        }
     }
 }

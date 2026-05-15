@@ -1,7 +1,7 @@
 # ignore test fuzzing files
 fuzzers/inprocess/**
-!fuzzers/inprocess/libfun/
-!fuzzers/inprocess/libfun/**
+!fuzzers/inprocess/bofuzz/
+!fuzzers/inprocess/bofuzz/**
 /example/work/
 /eval/results/
 

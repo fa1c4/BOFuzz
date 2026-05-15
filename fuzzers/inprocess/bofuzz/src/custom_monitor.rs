@@ -1,12 +1,7 @@
-// src/custom_monitor.rs
-use std::{
-    fmt,
-    fmt::Write,
-    time::Duration,
-};
+use std::{fmt, fmt::Write, time::Duration};
 
-use libafl_bolts::{current_time, format_duration_hms, ClientId};
 use libafl::monitors::{ClientStats, Monitor, UserStats, UserStatsValue};
+use libafl_bolts::{current_time, format_duration_hms, ClientId};
 
 #[derive(Clone)]
 pub struct CustomMonitor<F>
@@ -123,15 +118,15 @@ where
                         use std::fmt::Write as _;
                         write!(
                             extra,
-                            "[features-info] enabled={} active={} mode={} exists={} α={:.2} β={:.2} g=[{:.2},{:.2}] tanh={} v_cands={} feat0={:.3} path_w={:.3} factor={:.3} v={}",
+                            "[BOFuzz features-info] enabled={} active={} mode={} exists={} α={:.2} β={:.2} g=[{:.2},{:.2}] tanh={} active_dim={} v_cands={} feat0={:.3} path_w={:.3} factor={:.3} v={}",
                             parsed.enabled, parsed.active, parsed.feat_mode, parsed.feat_exists,
                             parsed.alpha, parsed.beta, parsed.gmin, parsed.gmax, parsed.use_tanh,
-                            parsed.v_candidates_len, parsed.feat0, parsed.path_w, parsed.factor,
+                            parsed.active_dim, parsed.v_candidates_len, parsed.feat0, parsed.path_w, parsed.factor,
                             parsed.current_v
                         ).unwrap();
                         to_print.push(extra);
                     } else {
-                        to_print.push(format!("[features-info] {}", s));
+                        to_print.push(format!("[BOFuzz features-info] {}", s));
                     }
                 }
             }
@@ -143,14 +138,14 @@ where
                         use std::fmt::Write as _;
                         write!(
                             extra,
-                            "[tpe-info] ΔEdges={:.1} Coverage={} trials={} corpus={} α={:.2} ‖v‖={:.2} bw={:.2} γ={:.2} samples={} period={} v={}",
+                            "[BOFuzz tpe-info] ΔEdges={:.1} Coverage={} trials={} corpus={} α={:.2} ‖v‖={:.2} active_dim={} bw={:.2} γ={:.2} samples={} period={} v={}",
                             parsed.reward, parsed.cov, parsed.trials, parsed.corpus,
-                            parsed.alpha, parsed.v_norm, parsed.bw, parsed.gamma,
+                            parsed.alpha, parsed.v_norm, parsed.active_dim, parsed.bw, parsed.gamma,
                             parsed.samples, parsed.period, parsed.vec
                         ).unwrap();
                         to_print.push(extra);
                     } else {
-                        to_print.push(format!("[tpe-info] {}", s));
+                        to_print.push(format!("[BOFuzz tpe-info] {}", s));
                     }
                 }
             }
@@ -181,6 +176,7 @@ struct FeaturesInfo {
     gmin: f64,
     gmax: f64,
     use_tanh: bool,
+    active_dim: u64,
     v_candidates_len: u64,
     current_v: String,
     feat0: f64,
@@ -196,6 +192,7 @@ struct TpeInfo {
     corpus: u64,
     alpha: f64,
     v_norm: f64,
+    active_dim: u64,
     vec: String,
     bw: f64,
     gamma: f64,
@@ -220,6 +217,7 @@ fn parse_features_info(s: &str) -> Option<FeaturesInfo> {
             "gmin" => out.gmin = parse_num(v),
             "gmax" => out.gmax = parse_num(v),
             "use_tanh" => out.use_tanh = parse_bool(v),
+            "active_dim" => out.active_dim = v.parse().ok().unwrap_or(0),
             "v_candidates_len" => out.v_candidates_len = v.parse().ok().unwrap_or(0),
             "current_v" => out.current_v = v.to_string(),
             "feat0" => out.feat0 = parse_num(v),
@@ -245,7 +243,8 @@ fn parse_tpe_info(s: &str) -> Option<TpeInfo> {
             "corpus" => out.corpus = v.parse().ok().unwrap_or(0),
             "alpha" => out.alpha = parse_num(v),
             "v_norm" => out.v_norm = parse_num(v),
-            "v0_8" => out.vec = v.to_string(),
+            "active_dim" => out.active_dim = v.parse().ok().unwrap_or(0),
+            "v" => out.vec = v.to_string(),
             "bw" => out.bw = parse_num(v),
             "gamma" => out.gamma = parse_num(v),
             "samples" => out.samples = v.parse().ok().unwrap_or(0),
@@ -272,7 +271,10 @@ fn split_kv(seg: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_bool(s: &str) -> bool {
-    matches!(s, "1" | "true" | "True" | "TRUE" | "yes" | "Yes" | "on" | "On")
+    matches!(
+        s,
+        "1" | "true" | "True" | "TRUE" | "yes" | "Yes" | "on" | "On"
+    )
 }
 
 fn parse_num(s: &str) -> f64 {

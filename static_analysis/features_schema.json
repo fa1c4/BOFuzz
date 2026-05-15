@@ -1,0 +1,21 @@
+{
+  "schema_version": 3,
+  "features": [
+    {"id": "I00", "name": "bb_instruction_count", "group": "instruction"},
+    {"id": "I01", "name": "numeric_immediate_count", "group": "instruction"},
+    {"id": "I02", "name": "string_literal_ref_count", "group": "instruction"},
+    {"id": "I03", "name": "const_data_ref_count", "group": "instruction"},
+    {"id": "I04", "name": "cmp_inst_count", "group": "instruction"},
+    {"id": "I05", "name": "arith_bitwise_count", "group": "instruction"},
+    {"id": "I06", "name": "mem_inst_count", "group": "instruction"},
+    {"id": "I07", "name": "call_count", "group": "instruction"},
+    {"id": "S00", "name": "cfg_in_degree", "group": "structural"},
+    {"id": "S01", "name": "cfg_out_degree", "group": "structural"},
+    {"id": "S02", "name": "static_descendant_count", "group": "structural"},
+    {"id": "S03", "name": "static_ancestor_count", "group": "structural"},
+    {"id": "S04", "name": "entry_depth", "group": "structural"},
+    {"id": "S05", "name": "loop_nesting_depth", "group": "structural"},
+    {"id": "S06", "name": "loop_boundary_flag", "group": "structural"},
+    {"id": "S07", "name": "centrality", "aliases": ["betweenness"], "group": "structural"}
+  ]
+}

@@ -1,51 +1,60 @@
-// feature_sched/tpe.rs
-use std::time::{Duration, Instant};
-use std::sync::RwLock;
-use libafl_bolts::{rands::{StdRand, Rand}, current_time};
+use crate::feature_sched::TpeHistoryMeta;
+use crate::feature_sched::{
+    get_active_dim, get_v_candidates, push_v_candidate, replace_v_candidates, vecn_eq,
+};
 use core::num::NonZeroUsize;
 use libafl::common::HasMetadata;
-use crate::feature_sched::TpeHistoryMeta;
-use crate::feature_sched::{get_v_candidates, push_v_candidate, vecn_eq, replace_v_candidates};
+use libafl_bolts::{
+    current_time,
+    rands::{Rand, StdRand},
+};
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
+use libafl::observers::map::StdMapObserver;
+use libafl::observers::HitcountsMapObserver;
 use libafl::observers::MapObserver;
 use libafl_bolts::tuples::Handle;
-use libafl::observers::HitcountsMapObserver;
-use libafl::observers::map::StdMapObserver;
 
 use core::fmt::Write as _;
 
 #[derive(Clone, Debug)]
 pub struct TpeParams {
-    pub gamma: f64,       // quantile threshold, like 0.2
-    pub samples: usize,   // samples size of L, like 64
-    pub bw: f64,          // KDE width like 0.15
-    pub period: Duration, // window period like 60s
+    pub gamma: f64,
+    pub samples: usize,
+    pub bw: f64,
+    pub period: Duration,
 }
 
 impl Default for TpeParams {
     fn default() -> Self {
-        Self { gamma: 0.2, samples: 32, bw: 0.05, period: Duration::from_secs(60) }
+        Self {
+            gamma: 0.2,
+            samples: 32,
+            bw: 0.05,
+            period: Duration::from_secs(60),
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Trial {
-    pub vec: Vec<f64>,  // [alpha, v1..v8]
+    pub vec: Vec<f64>,
     pub reward: f64,
 }
 
 #[derive(Clone, Debug)]
 pub struct TpeState {
     pub trials: Vec<Trial>,
-    pub last_vec: Vec<f64>,         // last applying vector
+    pub last_vec: Vec<f64>,
     pub window_start: Option<Instant>,
-    pub last_corpus: Option<usize>, // last corpus.count of window
-    pub last_cov: Option<usize>,    // last coverage edges of window
-    pub no_new_counter: usize,      
-    pub lock_best: bool,            // convergence flag
-    pub best_fixed: Vec<f64>,       // best vec
-    pub restored_once: bool,        // TpeStage entry restore once
-    pub first_window: bool,         // TpeStage starting window
+    pub last_corpus: Option<usize>,
+    pub last_cov: Option<usize>,
+    pub no_new_counter: usize,
+    pub lock_best: bool,
+    pub best_fixed: Vec<f64>,
+    pub restored_once: bool,
+    pub first_window: bool,
 }
 
 impl Default for TpeState {
@@ -70,7 +79,6 @@ fn now_epoch_ms() -> u64 {
 }
 
 fn rand_gaussian(rng: &mut StdRand) -> f64 {
-    // Box-Muller: generate gaussian value mu as 0 and sigma as 1
     let u1 = (rng.next_float() as f64).clamp(f64::MIN_POSITIVE, 1.0);
     let u2 = rng.next_float() as f64;
     let r = (-2.0 * u1.ln()).sqrt();
@@ -85,22 +93,34 @@ pub struct TpeOptimizer {
 
 impl TpeOptimizer {
     pub fn new(params: TpeParams) -> Self {
-        Self { params, state: RwLock::new(TpeState::default()) }
+        Self {
+            params,
+            state: RwLock::new(TpeState::default()),
+        }
     }
 
     pub fn restore_once<S: HasMetadata>(&self, state: &S) {
         let mut s = self.state.write().unwrap();
-        if s.restored_once { return; }
+        if s.restored_once {
+            return;
+        }
         s.restored_once = true;
 
         if let Some(meta) = state.metadata_map().get::<TpeHistoryMeta>() {
             s.trials.clear();
             s.trials.reserve(meta.trials.len());
             for (v, r, _ts) in &meta.trials {
-                s.trials.push(Trial { vec: v.clone(), reward: *r });
+                s.trials.push(Trial {
+                    vec: v.clone(),
+                    reward: *r,
+                });
             }
 
-            let max_trials = if meta.max_trials == 0 { 1024 } else { meta.max_trials };
+            let max_trials = if meta.max_trials == 0 {
+                1024
+            } else {
+                meta.max_trials
+            };
             if s.trials.len() > max_trials {
                 let drop_n = s.trials.len() - max_trials;
                 s.trials.drain(0..drop_n);
@@ -158,14 +178,18 @@ impl TpeOptimizer {
     pub fn observe(&self, vec: &[f64], reward: f64) {
         let mut s = self.state.write().unwrap();
         if let Some(last) = s.trials.last_mut() {
-            // do not push same vec, only update reward 
             if vecn_eq(&last.vec, vec, 1e-6) {
-                if reward > last.reward { last.reward = reward; }
+                if reward > last.reward {
+                    last.reward = reward;
+                }
                 return;
             }
         }
 
-        s.trials.push(Trial { vec: vec.to_vec(), reward });
+        s.trials.push(Trial {
+            vec: vec.to_vec(),
+            reward,
+        });
 
         const MAX_TRIALS: usize = 1024;
         if s.trials.len() > MAX_TRIALS {
@@ -195,19 +219,27 @@ impl TpeOptimizer {
 
             let mut cand = vec![0.0; d];
             for j in 0..d {
-                let z = rand_gaussian(rng);                 // N(0,1)
-                let mut v = base[j] + self.params.bw * z;   // width h = bw
-                if v < 0.0 { v = -v; }                      // reflect [0,1]
-                if v > 1.0 { v = 2.0 - v; }
+                let z = rand_gaussian(rng);
+                let mut v = base[j] + self.params.bw * z;
+                if v < 0.0 {
+                    v = -v;
+                }
+                if v > 1.0 {
+                    v = 2.0 - v;
+                }
                 cand[j] = v.clamp(0.0, 1.0);
             }
             let cand = project_vec(cand);
 
-            let dup_hist = hist.iter().any(|h| h.len() == cand.len() && vecn_eq(h, &cand, 1e-3));
+            let dup_hist = hist
+                .iter()
+                .any(|h| h.len() == cand.len() && vecn_eq(h, &cand, 1e-3));
             if dup_hist {
                 continue;
             }
-            let dup_pool = pool.iter().any(|p| p.len() == cand.len() && vecn_eq(p, &cand, 1e-3));
+            let dup_pool = pool
+                .iter()
+                .any(|p| p.len() == cand.len() && vecn_eq(p, &cand, 1e-3));
             if dup_pool {
                 continue;
             }
@@ -234,51 +266,7 @@ impl TpeOptimizer {
         }
     }
 
-    fn gen_kde_candidates_allin_L<S: HasMetadata>(&self, state: &mut S, rng: &mut StdRand) -> usize {
-        let (lset, gset, _y_star) = match self.split_l_g() {
-            Some(x) => x,
-            None => return 0, // history too few
-        };
-
-        let mut pool = get_v_candidates(state);
-        let hist = {
-            let s = self.state.read().unwrap();
-            s.trials.iter().map(|t| t.vec.clone()).collect::<Vec<_>>()
-        };
-
-        let eps = 1e-6;
-        let mut added = 0usize;
-        for _ in 0..self.params.samples {
-            let cand = project_vec(sample_from_kde_reflect(&lset, self.params.bw, rng));
-
-            let l = kde_pdf_reflect(&lset, &cand, self.params.bw);
-            let g = kde_pdf_reflect(&gset, &cand, self.params.bw);
-            let score = if g > 0.0 { l / g } else { f64::INFINITY };
-
-            if score <= 1.0 + eps {
-                continue;
-            }
-
-            let dup_hist = hist.iter().any(|h| h.len() == cand.len() && vecn_eq(h, &cand, 1e-3));
-            if dup_hist {
-                continue;
-            }
-
-            let dup_pool = pool.iter().any(|p| p.len() == cand.len() && vecn_eq(p, &cand, 1e-3));
-            if dup_pool {
-                continue;
-            }
-
-            push_v_candidate(state, cand.clone());
-            pool.push(cand);
-            added += 1;
-        }
-
-        added
-    }
-
     pub fn suggest<S: HasMetadata>(&self, state: &mut S, rng: &mut StdRand) -> Vec<f64> {
-        // 1) convergence: return best_v
         {
             let s = self.state.read().unwrap();
             if s.lock_best && !s.best_fixed.is_empty() {
@@ -286,15 +274,15 @@ impl TpeOptimizer {
             }
         }
 
-        // 2) from Lset generate new vec with KDE sampling which reward_prediction >0
         let _added = self.gen_kde_candidates(state, rng);
 
-        // 3) get next untried vec to apply 
         if let Some(v) = self.next_untried_from_pool(state) {
             return v;
         }
 
-        // 4) queue is empty then no more vec satisfied reward > 0: set convergence then return best_v in history
+        let active_dim = get_active_dim(state);
+        let vector_len = 1 + active_dim;
+
         let best = {
             let srd = self.state.read().unwrap();
             let all_nonpos = !srd.trials.is_empty() && srd.trials.iter().all(|t| t.reward <= 0.0);
@@ -303,13 +291,22 @@ impl TpeOptimizer {
             } else {
                 None
             }
-        }.or_else(|| self.best_by_lg())
+        }
+        .or_else(|| self.best_by_lg(vector_len))
         .or_else(|| {
             let s = self.state.read().unwrap();
-            if s.last_vec.is_empty() { None } else { Some(s.last_vec.clone()) }
+            if s.last_vec.is_empty() {
+                None
+            } else {
+                Some(s.last_vec.clone())
+            }
         })
         .unwrap_or_else(|| {
-            vec![0.5; 9]
+            let mut v = vec![0.5];
+            let d = if active_dim > 0 { active_dim } else { 1 };
+            let u = 1.0 / (d as f64).sqrt();
+            v.extend(std::iter::repeat(u).take(d));
+            v
         });
 
         {
@@ -347,21 +344,27 @@ impl TpeOptimizer {
 
     pub fn take_reward_from_corpus(&self, cur_corpus: usize) -> Option<f64> {
         let mut s = self.state.write().unwrap();
-        let r = s.last_corpus.map(|prev| (cur_corpus as i64 - prev as i64) as f64);
+        let r = s
+            .last_corpus
+            .map(|prev| (cur_corpus as i64 - prev as i64) as f64);
         s.last_corpus = Some(cur_corpus);
         r
     }
 
     pub fn persist_to_meta<S: HasMetadata>(&self, state: &mut S) {
         let s = self.state.read().unwrap();
-        let meta = state.metadata_map_mut().get_or_insert_with::<TpeHistoryMeta>(Default::default);
+        let meta = state
+            .metadata_map_mut()
+            .get_or_insert_with::<TpeHistoryMeta>(Default::default);
 
         meta.trials.clear();
         meta.trials.reserve(s.trials.len());
         for t in &s.trials {
             meta.trials.push((t.vec.clone(), t.reward, now_epoch_ms()));
         }
-        if meta.max_trials == 0 { meta.max_trials = 1024; }
+        if meta.max_trials == 0 {
+            meta.max_trials = 1024;
+        }
         if meta.trials.len() > meta.max_trials {
             let drop_n = meta.trials.len() - meta.max_trials;
             meta.trials.drain(0..drop_n);
@@ -377,21 +380,23 @@ impl TpeOptimizer {
         let mut out = String::new();
         let _ = writeln!(&mut out, "[tpe-trials] count={}", s.trials.len());
         for (i, t) in s.trials.iter().enumerate() {
-            let take = t.vec.len().min(9);
-            let vv = t.vec[..take].iter()
+            let vv = t
+                .vec
+                .iter()
                 .map(|x| format!("{:.4}", x))
                 .collect::<Vec<_>>()
                 .join(",");
             let _ = writeln!(
                 &mut out,
                 "[tpe-trial #{i}] ΔEdges={:.3} vec=[{}] len={}",
-                t.reward, vv, t.vec.len()
+                t.reward,
+                vv,
+                t.vec.len()
             );
         }
         out
     }
 
-    // traverse all init candidates weight_vec
     pub fn next_untried_from_pool<S: HasMetadata>(&self, state: &mut S) -> Option<Vec<f64>> {
         let hist = {
             let s = self.state.read().unwrap();
@@ -400,14 +405,16 @@ impl TpeOptimizer {
         let mut pool = get_v_candidates(state);
 
         while let Some(front) = pool.first() {
-            let seen = hist.iter().any(|h| h.len() == front.len() && vecn_eq(h, front, 1e-3));
+            let seen = hist
+                .iter()
+                .any(|h| h.len() == front.len() && vecn_eq(h, front, 1e-3));
             if seen {
                 pool.remove(0);
             } else {
                 break;
             }
         }
-      
+
         let out = if pool.is_empty() {
             None
         } else {
@@ -418,10 +425,11 @@ impl TpeOptimizer {
         out
     }
 
-    // calculate L/G sets and threshold according to trials, empty then return None
-    pub fn split_l_g<'a>(&'a self) -> Option<(Vec<Trial>, Vec<Trial>, f64)> {
+    pub fn split_l_g(&self) -> Option<(Vec<Trial>, Vec<Trial>, f64)> {
         let s = self.state.read().unwrap();
-        if s.trials.len() < 5 { return None; }
+        if s.trials.len() < 5 {
+            return None;
+        }
 
         let mut trials = s.trials.clone();
         drop(s);
@@ -432,7 +440,8 @@ impl TpeOptimizer {
         let mut y_star = trials[n - k].reward;
 
         if y_star <= 0.0 {
-            if let Some(min_pos) = trials.iter()
+            if let Some(min_pos) = trials
+                .iter()
                 .filter(|t| t.reward > 0.0)
                 .map(|t| t.reward)
                 .min_by(|a, b| a.partial_cmp(b).unwrap())
@@ -446,27 +455,37 @@ impl TpeOptimizer {
         let mut lset = Vec::new();
         let mut gset = Vec::new();
         for t in trials.into_iter() {
-            if t.reward >= y_star { lset.push(t); } else { gset.push(t); }
+            if t.reward >= y_star {
+                lset.push(t);
+            } else {
+                gset.push(t);
+            }
         }
-        if lset.is_empty() || gset.is_empty() { return None; }
+        if lset.is_empty() || gset.is_empty() {
+            return None;
+        }
         Some((lset, gset, y_star))
     }
 
-    // calculate v's l/g
     pub fn l_over_g(&self, v: &[f64]) -> Option<f64> {
         let (lset, gset, _) = self.split_l_g()?;
         let l = kde_pdf_reflect(&lset, v, self.params.bw);
         let g = kde_pdf_reflect(&gset, v, self.params.bw);
-        if g > 0.0 { Some(l / g) } else { Some(f64::INFINITY) }
+        if g > 0.0 {
+            Some(l / g)
+        } else {
+            Some(f64::INFINITY)
+        }
     }
 
-    // search for best v in history
-    pub fn best_by_lg(&self) -> Option<Vec<f64>> {
+    pub fn best_by_lg(&self, min_len: usize) -> Option<Vec<f64>> {
         let (lset, gset, _) = self.split_l_g()?;
         let s = self.state.read().unwrap();
         let mut best: Option<(f64, Vec<f64>)> = None;
         for t in &s.trials {
-            if t.vec.len() < 9 { continue; }
+            if t.vec.len() < min_len {
+                continue;
+            }
             let l = kde_pdf_reflect(&lset, &t.vec, self.params.bw);
             let g = kde_pdf_reflect(&gset, &t.vec, self.params.bw);
             let score = if g > 0.0 { l / g } else { f64::INFINITY };
@@ -480,13 +499,11 @@ impl TpeOptimizer {
     }
 }
 
-/* ---------------- KDE & sampler ---------------- */
 fn gaussian_pdf(z: f64) -> f64 {
     const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
     INV_SQRT_2PI * (-0.5 * z * z).exp()
 }
 
-// for [0,1] reflection from boundary: x, -x, 2-x
 fn reflect_pdf_1d(x: f64, mu: f64, h: f64) -> f64 {
     let z1 = (x - mu) / h;
     let z2 = (x + mu) / h;
@@ -510,37 +527,50 @@ fn kde_pdf_reflect(set: &[Trial], x: &[f64], h: f64) -> f64 {
 
 fn sample_from_kde_reflect(set: &[Trial], h: f64, rng: &mut StdRand) -> Vec<f64> {
     let d = set[0].vec.len();
-    let base = set[rng.below(NonZeroUsize::new(set.len()).unwrap())].vec.clone();
+    let base = set[rng.below(NonZeroUsize::new(set.len()).unwrap())]
+        .vec
+        .clone();
     let mut out = vec![0.0; d];
     for j in 0..d {
-        // Gause disturbance
-        let z = rand_gaussian(rng); // Gauss Rand
+        let z = rand_gaussian(rng);
         let mut v = base[j] + h * z;
-        if v < 0.0 { v = -v; }
-        if v > 1.0 { v = 2.0 - v; }
+        if v < 0.0 {
+            v = -v;
+        }
+        if v > 1.0 {
+            v = 2.0 - v;
+        }
         v = v.clamp(0.0, 1.0);
         out[j] = v;
     }
     project_vec(out)
 }
 
-// uniform
-fn project_vec(mut v: Vec<f64>) -> Vec<f64> {
-    if v.is_empty() { return v; }
-    // alpha is v[0]
+pub fn project_vec(mut v: Vec<f64>) -> Vec<f64> {
+    if v.is_empty() {
+        return v;
+    }
     v[0] = v[0].clamp(0.0, 1.0);
 
-    // left 8 dim uniform as L-2
     let d = v.len();
     if d > 1 {
         let mut norm2 = 0.0;
-        for j in 1..d { norm2 += v[j] * v[j]; }
+        for j in 1..d {
+            norm2 += v[j] * v[j];
+        }
         if norm2 > 0.0 {
             let inv = 1.0 / norm2.sqrt();
-            for j in 1..d { v[j] *= inv; }
+            for j in 1..d {
+                v[j] *= inv;
+            }
         } else {
-            let u = 1.0 / 8f64.sqrt();
-            for j in 1..=8.min(d-1) { v[j] = u; }
+            let active_dim = d - 1;
+            if active_dim > 0 {
+                let u = 1.0 / (active_dim as f64).sqrt();
+                for j in 1..d {
+                    v[j] = u;
+                }
+            }
         }
     }
     v
@@ -549,7 +579,7 @@ fn project_vec(mut v: Vec<f64>) -> Vec<f64> {
 fn jitter_and_project(v: &[f64], rng: &mut StdRand) -> Vec<f64> {
     let mut out = v.to_vec();
     for x in &mut out {
-        let delta = 0.05 * (rng.next_float() as f64 - 0.5) * 2.0; // [-0.05, 0.05]
+        let delta = 0.05 * (rng.next_float() as f64 - 0.5) * 2.0;
         *x = (*x + delta).clamp(0.0, 1.0);
     }
     project_vec(out)

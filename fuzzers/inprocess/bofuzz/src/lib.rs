@@ -1,7 +1,4 @@
-//! A singlethreaded libfuzzer-like fuzzer that can auto-restart.
-/*
-lib.rs: libfun fuzzer main entry
-*/
+//! BOFuzz: a singlethreaded libfuzzer-like fuzzer with static-feature scheduling.
 use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -31,13 +28,14 @@ use libafl::{
         havoc_mutations, token_mutations::I2SRandReplace, tokens_mutations, StdMOptMutator,
         StdScheduledMutator, Tokens,
     },
-    observers::{CanTrack, TimeObserver, HitcountsMapObserver},
     observers::map::StdMapObserver,
+    observers::{CanTrack, HitcountsMapObserver, TimeObserver},
     schedulers::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, StdWeightedScheduler,
     },
     stages::{
-        calibrate::CalibrationStage, StdMutationalStage, TracingStage, power::StdPowerMutationalStage,
+        calibrate::CalibrationStage, power::StdPowerMutationalStage, StdMutationalStage,
+        TracingStage,
     },
     state::{HasCorpus, StdState},
     Error, HasMetadata,
@@ -47,76 +45,96 @@ use libafl_bolts::{
     os::dup2,
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
-    tuples::{tuple_list, Merge, Handled},
+    tuples::{tuple_list, Handled, Merge},
     AsSlice,
 };
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use libafl_targets::autotokens;
 use libafl_targets::{
-    libfuzzer_initialize, libfuzzer_test_one_input, CmpLogObserver, std_edges_map_observer,
+    libfuzzer_initialize, libfuzzer_test_one_input, std_edges_map_observer, CmpLogObserver,
 };
 #[cfg(unix)]
 use nix::unistd::dup;
 
-// libfun mod
 mod feature_sched;
 use crate::feature_sched::{
-    features_map::load_and_align_features_map,
-    FeaturesAccountingStage, FeaturesMapMeta, FactorParams, FeaturesMatrixMeta, SancovIndexFeedback,
-    get_features_enabled, set_fuzz_start, get_fuzz_start,
-    set_factor_params, set_feat_exists,
-    set_explore_time, set_tpe_period,
-    set_tpe_satisfied, set_current_weight_vec,
-    set_feat_mode, set_alpha_init,
+    features_map::{
+        compute_active_features, load_and_align_features_map, load_and_validate_feature_map,
+        load_and_validate_schema, parse_vec_mask,
+    },
+    get_active_dim, get_active_feature_names, get_features_enabled, get_fuzz_start, set_alpha_init,
+    set_current_weight_vec, set_explore_time, set_factor_params, set_feat_exists, set_feat_mode,
+    set_fuzz_start, set_schema_info, set_tpe_period, set_tpe_satisfied, FactorParams,
+    FeaturesAccountingStage, FeaturesMapMeta, FeaturesMatrixMeta, SancovIndexFeedback,
 };
 mod custom_monitor;
 use crate::custom_monitor::CustomMonitor;
 
-use crate::feature_sched::{ TpeStage, TpeParams, get_tpe_period };
+use crate::feature_sched::{get_tpe_period, TpeParams, TpeStage};
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 extern "C" {
-    // fn __sanitizer_cov_reset_counters(); // reset map for each testcase | not linked 
-    // 8-bit counters
     static __start___sancov_cntrs: u8;
     static __stop___sancov_cntrs: u8;
-    // pc-table
     static __start___sancov_pcs: usize;
     static __stop___sancov_pcs: usize;
 }
 
-// feature/tpe parameters
 #[derive(Clone, Debug)]
-struct FunArgs {
+struct BofuzzArgs {
     factor_params: FactorParams,
     feat_mode: u8,
     explore_time_secs: u64,
     tpe_period_secs: u64,
 }
 
-// format vector printing
 fn fmt_vec_short(v: &[f64], maxn: usize) -> String {
     let n = v.len();
     let take = n.min(maxn);
-    let mut s = v[..take].iter()
+    let mut s = v[..take]
+        .iter()
         .map(|x| format!("{:.3}", x))
         .collect::<Vec<_>>()
         .join(",");
-    if n > take { s.push_str(",..."); }
+    if n > take {
+        s.push_str(",...");
+    }
     format!("[{}] (len={})", s, n)
+}
+
+fn resolve_bofuzz_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?.to_path_buf();
+    for _ in 0..10 {
+        let candidate = dir.join("static_analysis/features_schema.json");
+        if candidate.exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("static_analysis/features_schema.json");
+        if candidate.exists() {
+            return Some(cwd);
+        }
+    }
+    None
+}
+
+fn default_schema_path() -> Option<PathBuf> {
+    let root = resolve_bofuzz_root()?;
+    Some(root.join("static_analysis/features_schema.json"))
 }
 
 /// The fuzzer main (as `no_mangle` C function)
 #[no_mangle]
 pub extern "C" fn libafl_main() {
-    // Registry the metadata types used in this fuzzer
-    // Needed only on no_std
-    // unsafe { RegistryBuilder::register::<Tokens>(); }
-
     let res = match Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
-        .author("AFLplusplus team")
-        .about("LibAFL-based fuzzer for Fuzzbench")
+        .author("BOFuzz team")
+        .about("BOFuzz: LibAFL-based fuzzer with static-feature scheduling")
         .arg(
             Arg::new("out")
                 .short('o')
@@ -150,61 +168,71 @@ pub extern "C" fn libafl_main() {
                 .default_value("1200"),
         )
         .arg(
+            Arg::new("features-schema")
+                .long("features-schema")
+                .help("Path to features_schema.json (default: BOFuzz/static_analysis/features_schema.json)")
+        )
+        .arg(
             Arg::new("features")
               .long("features-map")
               .help("Path to {target}_features_map.json")
-          )
+        )
+        .arg(
+            Arg::new("vec-mask")
+                .long("vec-mask")
+                .help("Feature mask aligned to features_schema.json order. Accepts '[1,0,...]', '1,0,...', or bitstring '1010...'.")
+        )
         .arg(
             Arg::new("alpha")
                 .long("alpha")
                 .default_value("0.2")
                 .help("the <alpha> * features_factor")
-            )
+        )
         .arg(
             Arg::new("beta")
                 .long("beta")
                 .default_value("0.6")
                 .help("exp(<beta>)")
-            )
+        )
         .arg(
             Arg::new("gmin")
                 .long("gmin")
                 .default_value("0.5")
                 .help("factor range: (<gmin>, gmax)")
-            )
+        )
         .arg(
             Arg::new("gmax")
                 .long("gmax")
                 .default_value("3.0")
                 .help("factor range: (gmin, <gmax>)")
-            )
+        )
         .arg(
             Arg::new("tanh")
                 .long("tanh")
                 .action(clap::ArgAction::SetTrue)
                 .help("use tanh mapping instead of exp")
-            )
+        )
         .arg(
             Arg::new("feat-mode")
                 .long("feat-mode")
                 .value_parser(clap::value_parser!(u8).range(0..=3))
-                .default_value("0")
-                .help("0: off, 1: weight only, 2: power only, 3: both")
-            )
+                .default_value("1")
+                .help("0: off, 1: weight scheduling only, 2: power scheduling only, 3: both")
+        )
         .arg(
-            Arg::new("explore-time")
-                .long("explore-time")
+            Arg::new("explore-time-secs")
+                .long("explore-time-secs")
                 .value_parser(clap::value_parser!(u64))
-                .default_value("12")
-                .help("explore time set for explore stage, default is 12 hours")
-            )
+                .default_value("43200")
+                .help("Explore time before enabling features, in seconds (default: 43200 = 12 hours)")
+        )
         .arg(
-            Arg::new("tpe-period")
-                .long("tpe-period")
+            Arg::new("tpe-period-secs")
+                .long("tpe-period-secs")
                 .value_parser(clap::value_parser!(u64))
-                .default_value("10")
-                .help("TPE period set for TPE learning period each iteration, default is 10 min")
-            )
+                .default_value("600")
+                .help("TPE learning period per iteration, in seconds (default: 600 = 10 minutes)")
+        )
         .arg(Arg::new("remaining"))
         .try_get_matches()
     {
@@ -234,7 +262,6 @@ pub extern "C" fn libafl_main() {
         }
     }
 
-    // For fuzzbench, crashes and finds are inside the same `corpus` directory, in the "queue" and "crashes" subdir.
     let mut out_dir = PathBuf::from(
         res.get_one::<String>("out")
             .expect("The --output parameter is missing")
@@ -273,29 +300,104 @@ pub extern "C" fn libafl_main() {
             .expect("Could not parse timeout in milliseconds"),
     );
 
+    // --- Step 1: Resolve schema path ---
+    let schema_path: PathBuf = if let Some(p) = res.get_one::<String>("features-schema") {
+        PathBuf::from(p)
+    } else {
+        match default_schema_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("BOFuzz feature schema error: missing required file BOFuzz/static_analysis/features_schema.json");
+                eprintln!("Provide --features-schema or ensure BOFuzz/static_analysis/features_schema.json exists.");
+                process::exit(1);
+            }
+        }
+    };
+
+    // --- Step 2: Load and validate schema ---
+    let schema = match load_and_validate_schema(&schema_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    };
+    let schema_dim = schema.features.len();
+    eprintln!(
+        "[BOFuzz] schema loaded: version={} features={} path={}",
+        schema.schema_version,
+        schema_dim,
+        schema_path.display()
+    );
+
+    // --- Step 3: Parse --vec-mask or default to all-ones ---
+    let vec_mask: Vec<bool> = if let Some(mask_str) = res.get_one::<String>("vec-mask") {
+        match parse_vec_mask(mask_str, schema_dim) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+    } else {
+        vec![true; schema_dim]
+    };
+
+    // --- Step 4: Compute active features ---
+    let active_features = compute_active_features(&schema, &vec_mask);
+    let active_dim = active_features.len();
+    let active_names: Vec<String> = active_features.iter().map(|f| f.name.clone()).collect();
+    let mask_str: String = vec_mask
+        .iter()
+        .map(|&b| if b { '1' } else { '0' })
+        .collect();
+
+    eprintln!(
+        "[BOFuzz features] schema={} schema_dim={} active_dim={} mask={} active=[{}]",
+        schema.schema_version,
+        schema_dim,
+        active_dim,
+        mask_str,
+        active_features
+            .iter()
+            .map(|f| format!("{}:{}", f.id, f.name))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
     let cli_features_path = res.get_one::<String>("features").map(PathBuf::from);
     let params = FactorParams {
         alpha: res.get_one::<String>("alpha").unwrap().parse().unwrap(),
-        beta:  res.get_one::<String>("beta").unwrap().parse().unwrap(),
-        gmin:  res.get_one::<String>("gmin").unwrap().parse().unwrap(),
-        gmax:  res.get_one::<String>("gmax").unwrap().parse().unwrap(),
+        beta: res.get_one::<String>("beta").unwrap().parse().unwrap(),
+        gmin: res.get_one::<String>("gmin").unwrap().parse().unwrap(),
+        gmax: res.get_one::<String>("gmax").unwrap().parse().unwrap(),
         use_tanh: res.get_flag("tanh"),
     };
 
-    let fun_args = FunArgs {
+    let bofuzz_args = BofuzzArgs {
         factor_params: params,
         feat_mode: *res.get_one::<u8>("feat-mode").unwrap(),
-        explore_time_secs: *res.get_one::<u64>("explore-time").unwrap(),
-        tpe_period_secs: *res.get_one::<u64>("tpe-period").unwrap(),
+        explore_time_secs: *res.get_one::<u64>("explore-time-secs").unwrap(),
+        tpe_period_secs: *res.get_one::<u64>("tpe-period-secs").unwrap(),
     };
 
-    fuzz(out_dir, crashes, &in_dir, tokens, &logfile, timeout, cli_features_path, fun_args)
-        .expect("An error occurred while fuzzing");
+    fuzz(
+        out_dir,
+        crashes,
+        &in_dir,
+        tokens,
+        &logfile,
+        timeout,
+        cli_features_path,
+        bofuzz_args,
+        schema,
+        vec_mask,
+        active_features,
+    )
+    .expect("An error occurred while fuzzing");
 }
 
 fn run_testcases(filenames: &[&str]) {
-    // The actual target run starts here.
-    // Call LLVMFUzzerInitialize() if present.
     let args: Vec<String> = env::args().collect();
     if unsafe { libfuzzer_initialize(&args) } == -1 {
         println!("Warning: LLVMFuzzerInitialize failed with -1");
@@ -328,9 +430,16 @@ fn fuzz(
     logfile: &PathBuf,
     timeout: Duration,
     cli_features_path: Option<PathBuf>,
-    fun_args: FunArgs,
+    bofuzz_args: BofuzzArgs,
+    schema: feature_sched::FeatureSchemaFile,
+    vec_mask: Vec<bool>,
+    active_features: Vec<feature_sched::FeatureSpec>,
 ) -> Result<(), Error> {
     let log = RefCell::new(OpenOptions::new().append(true).create(true).open(logfile)?);
+
+    let active_dim = active_features.len();
+    let active_names: Vec<String> = active_features.iter().map(|f| f.name.clone()).collect();
+    let schema_dim = schema.features.len();
 
     #[cfg(unix)]
     let mut stdout_cpy = unsafe {
@@ -340,14 +449,6 @@ fn fuzz(
     #[cfg(unix)]
     let file_null = File::open("/dev/null")?;
 
-    // 'While the monitor are state, they are usually used in the broker - which is likely never restarted
-    // let monitor = SimpleMonitor::new(|s| {
-    //     #[cfg(unix)]
-    //     writeln!(&mut stdout_cpy, "{s}").unwrap();
-    //     #[cfg(windows)]
-    //     println!("{s}");
-    //     writeln!(log.borrow_mut(), "{:?} {s}", current_time()).unwrap();
-    // });
     let monitor = CustomMonitor::new(|s| {
         #[cfg(unix)]
         writeln!(&mut stdout_cpy, "{s}").unwrap();
@@ -356,13 +457,10 @@ fn fuzz(
         writeln!(log.borrow_mut(), "{:?} {s}", current_time()).unwrap();
     });
 
-    // We need a shared map to store our state before a crash.
-    // This way, we are able to continue fuzzing afterwards.
     let mut shmem_provider = StdShMemProvider::new()?;
 
     let (state, mut mgr) = match SimpleRestartingEventManager::launch(monitor, &mut shmem_provider)
     {
-        // The restarting state will spawn the same process again as child, then restarted it each time it crashes.
         Ok(res) => res,
         Err(err) => match err {
             Error::ShuttingDown => {
@@ -374,33 +472,31 @@ fn fuzz(
         },
     };
 
-    // Create an observation channel using the coverage map
-    // let edges_observer =
-    //     HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
-    // let edges_handle = edges_observer.handle();
-    let edges_observer = HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
+    let edges_observer =
+        HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
 
-    // in libfun we use sancov cntrs_ptr to align indices with static features
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     let (sancov_observer, sancov_sites, cntrs_ptr) = unsafe {
         let start = &__start___sancov_cntrs as *const u8 as usize;
         let stop = &__stop___sancov_cntrs as *const u8 as usize;
-        let sancov_sites = stop.checked_sub(start).expect("sancov cntrs pointers inverted?");
+        let sancov_sites = stop
+            .checked_sub(start)
+            .expect("sancov cntrs pointers inverted?");
         let cntrs_ptr = start as *mut u8;
-        // check the length of sites (8-bit counters) and pc-table are consistent
         let pcs_start = &__start___sancov_pcs as *const usize as usize;
         let pcs_stop = &__stop___sancov_pcs as *const usize as usize;
         let word_len = core::mem::size_of::<usize>();
         let pcs_sites = (pcs_stop - pcs_start) / (2 * word_len);
-        assert_eq!(sancov_sites, pcs_sites, "sancov cntrs/pcs size mismatch: {sancov_sites} vs {pcs_sites}");
-    
-        // set 8-bit counters observer
+        assert_eq!(
+            sancov_sites, pcs_sites,
+            "sancov cntrs/pcs size mismatch: {sancov_sites} vs {pcs_sites}"
+        );
+
         let obs = StdMapObserver::<u8, false>::from_mut_ptr("sancov", cntrs_ptr, sancov_sites);
         (obs, sancov_sites, cntrs_ptr)
     };
     let sancov_handle = sancov_observer.handle();
 
-    // Create an observation channel to keep track of the execution time
     let time_observer = TimeObserver::new("time");
 
     let cmplog_observer = CmpLogObserver::new("cmplog", true);
@@ -410,46 +506,49 @@ fn fuzz(
 
     let calibration = CalibrationStage::new(&map_feedback);
 
-    // Feedback to rate the interestingness of an input
-    // This one is composed by two Feedbacks in OR
     let mut feedback = feedback_or!(
-        // New maximization map feedback linked to the edges observer and the feedback state
         map_feedback,
-        // Time feedback, this one does not need a feedback state
         TimeFeedback::new(&time_observer),
         sancov_idx_fb
     );
 
-    // A feedback to choose if an input is a solution or not
     let mut objective = CrashFeedback::new();
 
-    // If not restarting, create a State from scratch
     let mut state = state.unwrap_or_else(|| {
         StdState::new(
-            // RNG
             StdRand::new(),
-            // Corpus that will be evolved, we keep it in memory for performance
             InMemoryOnDiskCorpus::new(corpus_dir.clone()).unwrap(),
-            // Corpus in which we store solutions (crashes in this example),
-            // on disk so the user can get them after stopping the fuzzer
             OnDiskCorpus::new(objective_dir.clone()).unwrap(),
-            // States of the feedbacks.
-            // The feedbacks can report the data that should persist in the State.
             &mut feedback,
-            // Same for objective feedbacks
             &mut objective,
         )
         .unwrap()
     });
 
-    // setting funafl parameters
-    set_alpha_init(&mut state, fun_args.factor_params.alpha);
-    set_factor_params(&mut state, fun_args.factor_params.clone());
-    eprintln!(
-        "[factor-params] alpha={:.3}, beta={:.3}, gmin={:.3}, gmax={:.3}, use_tanh={}",
-        fun_args.factor_params.alpha, fun_args.factor_params.beta, fun_args.factor_params.gmin, fun_args.factor_params.gmax, fun_args.factor_params.use_tanh
+    // --- Runtime startup order (Section 4.6) ---
+
+    // 1. Store schema info in state metadata
+    set_schema_info(
+        &mut state,
+        schema.schema_version,
+        schema.features.clone(),
+        vec_mask.clone(),
+        active_features.clone(),
     );
 
+    // 2. Set factor params
+    set_alpha_init(&mut state, bofuzz_args.factor_params.alpha);
+    set_factor_params(&mut state, bofuzz_args.factor_params.clone());
+    eprintln!(
+        "[BOFuzz params] alpha={:.3}, beta={:.3}, gmin={:.3}, gmax={:.3}, use_tanh={}",
+        bofuzz_args.factor_params.alpha,
+        bofuzz_args.factor_params.beta,
+        bofuzz_args.factor_params.gmin,
+        bofuzz_args.factor_params.gmax,
+        bofuzz_args.factor_params.use_tanh
+    );
+
+    // 3. Default features path: same directory as binary, named {target}_features_map.json
     fn default_features_path() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
@@ -457,64 +556,95 @@ fn fuzz(
         Some(exe_dir.join(format!("{}_features_map.json", stem)))
     }
 
-    // use /path_to/the_same_directory/{target_name}_features_map.json file as default file path
-    let chosen_path = if let Some(p) = cli_features_path { Some(p) } else { default_features_path() };
+    let chosen_path = if let Some(p) = cli_features_path {
+        Some(p)
+    } else {
+        default_features_path()
+    };
     let chosen_path = chosen_path.and_then(|p| if p.exists() { Some(p) } else { None });
 
+    // 4. Validate feature map against schema if present
     let mut pending_feats: Option<Vec<f64>> = None;
     let mut pending_matrix: Option<std::collections::HashMap<String, Vec<f64>>> = None;
     let mut has_feats = false;
+
     if let Some(p) = chosen_path.as_ref() {
-        match load_and_align_features_map(&mut state, p, sancov_sites) {
-            Ok((feats, matrix_opt)) => {
-                eprintln!("[features] using features map: {}", p.display());
-                pending_feats = Some(feats);
-                pending_matrix = matrix_opt;
-                has_feats = true;
+        // Validate the feature map strictly against the schema
+        match load_and_validate_feature_map(p, &schema, sancov_sites) {
+            Ok(_validated_map) => {
+                // Map validated; now load and align
+                match load_and_align_features_map(
+                    &mut state,
+                    p,
+                    sancov_sites,
+                    active_dim,
+                    &active_names,
+                    &vec_mask,
+                    schema_dim,
+                ) {
+                    Ok((feats, matrix_opt)) => {
+                        eprintln!("[BOFuzz] using features map: {}", p.display());
+                        pending_feats = Some(feats);
+                        pending_matrix = matrix_opt;
+                        has_feats = true;
+                    }
+                    Err(e) => {
+                        eprintln!("[BOFuzz] feature-map load failed: {}. Feature map is present but invalid — aborting.", e);
+                        process::exit(1);
+                    }
+                }
             }
             Err(e) => {
-                eprintln!("[features] failed to load {}: {e}. Disabling features.", p.display());
-                has_feats = false;
+                eprintln!("{}", e);
+                eprintln!("[BOFuzz] Feature map is present but invalid — aborting.");
+                process::exit(1);
             }
         }
     } else {
-        eprintln!("[features] no features map provided/found. Disabling features.");
+        eprintln!("[BOFuzz] no features map provided/found. Falling back to cold fuzzing.");
         has_feats = false;
     }
 
-    // Fuzz Start Time record
     set_fuzz_start(&mut state);
-    eprintln!("[params] fuzz start time: {} s", get_fuzz_start(&state) / 1000);
+    eprintln!(
+        "[BOFuzz params] fuzz start time: {} s",
+        get_fuzz_start(&state) / 1000
+    );
 
-    // add features_map to metadata
     if let Some(feats) = pending_feats.take() {
         state.add_metadata(FeaturesMapMeta { feats });
     }
-    // add source features_map matrix to metadata
     if let Some(matrix) = pending_matrix.take() {
-        state.add_metadata(FeaturesMatrixMeta { matrix, sites: sancov_sites });
+        state.add_metadata(FeaturesMatrixMeta {
+            matrix,
+            sites: sancov_sites,
+        });
     }
     set_feat_exists(&mut state, has_feats);
 
-    set_feat_mode(&mut state, fun_args.feat_mode);
-    eprintln!("[factor-params] feat_mode={}", fun_args.feat_mode);
+    set_feat_mode(&mut state, bofuzz_args.feat_mode);
+    eprintln!("[BOFuzz params] feat_mode={}", bofuzz_args.feat_mode);
 
-    set_explore_time(&mut state, fun_args.explore_time_secs);
+    set_explore_time(&mut state, bofuzz_args.explore_time_secs);
 
-    set_tpe_period(&mut state, fun_args.tpe_period_secs);
-    eprintln!("[factor-params] explore_time={} hours, tpe_period={} minutes", 
-        fun_args.explore_time_secs / 60 / 60, fun_args.tpe_period_secs / 60);
+    set_tpe_period(&mut state, bofuzz_args.tpe_period_secs);
+    eprintln!(
+        "[BOFuzz params] explore_time_secs={}, tpe_period_secs={}",
+        bofuzz_args.explore_time_secs, bofuzz_args.tpe_period_secs
+    );
 
     eprintln!(
-        "[params] features_enabled={}, features_map={}",
+        "[BOFuzz params] features_enabled={}, features_map={}, active_dim={}, schema_dim={}",
         get_features_enabled(&state),
         chosen_path
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<none>".into())
+            .unwrap_or_else(|| "<none>".into()),
+        active_dim,
+        schema_dim,
     );
     eprintln!(
-        "[params] timeout_ms={}, corpus_dir={}, crashes_dir={}, seeds_dir={}, tokens={}",
+        "[BOFuzz params] timeout_ms={}, corpus_dir={}, crashes_dir={}, seeds_dir={}, tokens={}",
         timeout.as_millis(),
         corpus_dir.display(),
         objective_dir.display(),
@@ -525,21 +655,17 @@ fn fuzz(
             .unwrap_or_else(|| "<none>".into())
     );
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    eprintln!("[params] sancov_sites={}", sancov_sites);
+    eprintln!("[BOFuzz params] sancov_sites={}", sancov_sites);
 
     println!("Let's fuzz :)");
 
-    // The actual target run starts here.
-    // Call LLVMFUzzerInitialize() if present.
     let args: Vec<String> = env::args().collect();
     if unsafe { libfuzzer_initialize(&args) } == -1 {
         println!("Warning: LLVMFuzzerInitialize failed with -1");
     }
 
-    // Setup a randomic Input2State stage
     let i2s = StdMutationalStage::new(StdScheduledMutator::new(tuple_list!(I2SRandReplace::new())));
 
-    // Setup a MOPT mutator
     let mutator = StdMOptMutator::new(
         &mut state,
         havoc_mutations().merge(tokens_mutations()),
@@ -550,7 +676,6 @@ fn fuzz(
     let power: StdPowerMutationalStage<_, _, BytesInput, _, _, _> =
         StdPowerMutationalStage::new(mutator);
 
-    // A minimization+queue policy to get testcasess from the corpus
     let scheduler = IndexesLenTimeMinimizerScheduler::new(
         &edges_observer,
         StdWeightedScheduler::with_schedule(
@@ -560,14 +685,13 @@ fn fuzz(
         ),
     );
 
-    // A fuzzer with feedbacks and a corpus scheduler
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-    // The wrapped harness function, calling out to the LLVM-style harness
     let mut harness = |input: &BytesInput| {
-        // reset the inline-counters map for each testcase
         #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-        unsafe { core::ptr::write_bytes(cntrs_ptr, 0, sancov_sites); }
+        unsafe {
+            core::ptr::write_bytes(cntrs_ptr, 0, sancov_sites);
+        }
 
         let target = input.target_bytes();
         let buf = target.as_slice();
@@ -579,10 +703,8 @@ fn fuzz(
 
     let mut tracing_harness = harness;
 
-    // Create the executor for an in-process function with one observer for edge coverage and one for the execution time
     let mut executor = InProcessExecutor::with_timeout(
         &mut harness,
-        // tuple_list!(edges_observer, time_observer),
         tuple_list!(edges_observer, sancov_observer, time_observer),
         &mut fuzzer,
         &mut state,
@@ -590,31 +712,23 @@ fn fuzz(
         timeout,
     )?;
 
-    // Setup a tracing stage in which we log comparisons
-    let tracing = TracingStage::new(
-        InProcessExecutor::with_timeout(
-            &mut tracing_harness,
-            tuple_list!(cmplog_observer),
-            &mut fuzzer,
-            &mut state,
-            &mut mgr,
-            timeout * 10,
-        )?,
-        // Give it more time!
-    );
+    let tracing = TracingStage::new(InProcessExecutor::with_timeout(
+        &mut tracing_harness,
+        tuple_list!(cmplog_observer),
+        &mut fuzzer,
+        &mut state,
+        &mut mgr,
+        timeout * 10,
+    )?);
 
-    // The order of the stages matter!
-    // let mut stages = tuple_list!(calibration, tracing, i2s, power);
     let feat_stage = FeaturesAccountingStage::new(sancov_handle.clone());
 
-    // build TPE stage（period from CLI -> get_tpe_period())
     let edges_name = "edges".to_string();
     let tpe_stage = {
         let mut p = TpeParams::default();
         p.period = Duration::from_secs(get_tpe_period(&state));
         TpeStage::new(p, edges_name.clone())
     };
-    // record baseline corpus, for ΔCorpus reward
     {
         let cur_corpus = state.corpus().count();
         tpe_stage.opt.set_last_corpus(cur_corpus);
@@ -622,7 +736,6 @@ fn fuzz(
 
     let mut stages = tuple_list!(calibration, tracing, feat_stage, i2s, power, tpe_stage);
 
-    // Read tokens
     if state.metadata_map().get::<Tokens>().is_none() {
         let mut toks = Tokens::default();
         if let Some(tokenfile) = tokenfile {
@@ -638,7 +751,6 @@ fn fuzz(
         }
     }
 
-    // In case the corpus is empty (on first run), reset
     if state.must_load_initial_inputs() {
         state
             .load_initial_inputs(&mut fuzzer, &mut executor, &mut mgr, &[seed_dir.clone()])
@@ -649,7 +761,6 @@ fn fuzz(
         println!("We imported {} inputs from disk.", state.corpus().count());
     }
 
-    // Remove target output (logs still survive)
     #[cfg(unix)]
     {
         let null_fd = file_null.as_raw_fd();
@@ -658,11 +769,9 @@ fn fuzz(
             dup2(null_fd, io::stderr().as_raw_fd())?;
         }
     }
-    // reopen file to make sure we're at the end
     log.replace(OpenOptions::new().append(true).create(true).open(logfile)?);
 
     fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
 
-    // Never reached
     Ok(())
 }

@@ -1659,6 +1659,36 @@ def build_and_save_features_map_for_u(pcs, blocks, func_of_bb, u, out_filename,
         print(f"[+] Saved features_map (u provided) -> {out_path}")
     return fmap, out_path
 
+def _build_runtime_schema():
+    """Build the canonical runtime features_schema.json content (schema v3)."""
+    feature_ids = [
+        "I00", "I01", "I02", "I03", "I04", "I05", "I06", "I07",
+        "S00", "S01", "S02", "S03", "S04", "S05", "S06", "S07",
+    ]
+    features = []
+    for fid, name in zip(feature_ids, ATTR_NAMES):
+        group = "instruction" if fid.startswith("I") else "structural"
+        entry = {"id": fid, "name": name, "group": group}
+        if name == "centrality":
+            entry["aliases"] = ["betweenness"]
+        features.append(entry)
+    return {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "features": features,
+    }
+
+
+def save_runtime_schema(out_dir):
+    """Write the canonical BOFuzz/static_analysis/features_schema.json."""
+    schema = _build_runtime_schema()
+    schema_path = os.path.join(out_dir, "features_schema.json")
+    with open(schema_path, "w") as f:
+        json.dump(schema, f, indent=2)
+    if VERBOSE:
+        print(f"[+] Saved runtime features_schema.json -> {schema_path}")
+    return schema_path
+
+
 def save_schema_json(out_dir, base, execution=None, out_dir_override=None):
     if out_dir_override:
         out_dir = out_dir_override
@@ -1701,7 +1731,7 @@ def save_schema_json(out_dir, base, execution=None, out_dir_override=None):
     with open(schema_path, "w") as f:
         json.dump(schema, f, indent=2)
     if VERBOSE:
-        print(f"[+] Saved schema JSON -> {schema_path}")
+        print(f"[+] Saved target schema JSON -> {schema_path}")
     return schema_path
 
 # ============================== CLI / BOOTSTRAP ==============================
@@ -2006,6 +2036,9 @@ def run_extraction(args):
     execution["output_basename"] = base
     schema_path = save_schema_json(out_dir, base, execution=execution)
 
+    # Also write the canonical runtime schema to the output dir
+    runtime_schema_path = save_runtime_schema(out_dir)
+
     time_end = time.time()
     print(f"\n[+] DONE.")
     print(f"    Schema version : {FEATURE_SCHEMA_VERSION}")
@@ -2015,6 +2048,7 @@ def run_extraction(args):
     print(f"    Default map    : {out_map}")
     print(f"    Debug          : {out_dbg}")
     print(f"    Schema         : {schema_path}")
+    print(f"    Runtime schema : {runtime_schema_path}")
     print(f"    APageRank      : {'enabled' if USE_APAGERANK else 'disabled'}")
     print(f"    Mode           : {execution['mode']}")
     print(f"    Time           : {(time_end - time_start):.2f}s")

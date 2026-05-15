@@ -1,8 +1,9 @@
 /*
 features_sched/sancov_index_feedback.rs: update sancov indices
 */
-use std::borrow::Cow;
+use crate::feature_sched::SancovIndexesMetadata;
 use libafl::{
+    common::{HasMetadata, HasNamedMetadata},
     corpus::Testcase,
     events::{Event, EventFirer},
     executors::ExitKind,
@@ -10,11 +11,13 @@ use libafl::{
     inputs::Input,
     monitors::{AggregatorOps, UserStats, UserStatsValue},
     observers::MapObserver,
-    common::{HasMetadata, HasNamedMetadata},
     Error,
 };
-use libafl_bolts::{tuples::{Handle, Handled, MatchNameRef}, AsIter, Named};
-use crate::feature_sched::SancovIndexesMetadata;
+use libafl_bolts::{
+    tuples::{Handle, Handled, MatchNameRef},
+    AsIter, Named,
+};
+use std::borrow::Cow;
 
 #[derive(Clone, Debug)]
 pub struct SancovIndexFeedback<C>
@@ -43,14 +46,18 @@ impl<C> Named for SancovIndexFeedback<C>
 where
     C: MapObserver<Entry = u8> + Named,
 {
-    fn name(&self) -> &Cow<'static, str> { &self.name }
+    fn name(&self) -> &Cow<'static, str> {
+        &self.name
+    }
 }
 
 impl<S, C> StateInitializer<S> for SancovIndexFeedback<C>
 where
     C: MapObserver<Entry = u8> + Named,
 {
-    fn init_state(&mut self, _state: &mut S) -> Result<(), Error> { Ok(()) }
+    fn init_state(&mut self, _state: &mut S) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 impl<EM, I, OT, S, C> Feedback<EM, I, OT, S> for SancovIndexFeedback<C>
@@ -86,7 +93,9 @@ where
         let initial = map.initial();
         let mut idx = Vec::new();
         for (i, v) in map.as_iter().enumerate() {
-            if *v != initial { idx.push(i); }
+            if *v != initial {
+                idx.push(i);
+            }
         }
         if !idx.is_empty() {
             testcase.add_metadata(SancovIndexesMetadata::new(idx));
@@ -99,10 +108,14 @@ where
                 name: self.name.clone(),
                 value: UserStats::new(
                     UserStatsValue::Ratio(
-                        testcase.metadata_map().get::<SancovIndexesMetadata>().map(|m| m.list.len()).unwrap_or(0) as u64,
-                        map.len() as u64
+                        testcase
+                            .metadata_map()
+                            .get::<SancovIndexesMetadata>()
+                            .map(|m| m.list.len())
+                            .unwrap_or(0) as u64,
+                        map.len() as u64,
                     ),
-                    AggregatorOps::Avg
+                    AggregatorOps::Avg,
                 ),
                 phantom: core::marker::PhantomData,
             },
