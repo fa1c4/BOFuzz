@@ -229,7 +229,10 @@ impl TpeOptimizer {
                 }
                 cand[j] = v.clamp(0.0, 1.0);
             }
-            let cand = project_vec(cand);
+            let cand = match project_vec(cand) {
+                Some(c) => c,
+                None => continue,
+            };
 
             let dup_hist = hist
                 .iter()
@@ -302,6 +305,7 @@ impl TpeOptimizer {
             }
         })
         .unwrap_or_else(|| {
+            eprintln!("BOFuzz TPE warning: all generated candidates invalid; using deterministic uniform active vector");
             let mut v = vec![0.5];
             let d = if active_dim > 0 { active_dim } else { 1 };
             let u = 1.0 / (d as f64).sqrt();
@@ -418,7 +422,16 @@ impl TpeOptimizer {
         let out = if pool.is_empty() {
             None
         } else {
-            Some(project_vec(pool.remove(0)))
+            let raw = pool.remove(0);
+            match project_vec(raw) {
+                Some(projected) => Some(projected),
+                None => {
+                    eprintln!(
+                        "BOFuzz TPE warning: candidate from pool has zero-norm weights, skipping"
+                    );
+                    None
+                }
+            }
         };
         replace_v_candidates(state, pool);
 
@@ -525,7 +538,7 @@ fn kde_pdf_reflect(set: &[Trial], x: &[f64], h: f64) -> f64 {
     s / n
 }
 
-fn sample_from_kde_reflect(set: &[Trial], h: f64, rng: &mut StdRand) -> Vec<f64> {
+fn sample_from_kde_reflect(set: &[Trial], h: f64, rng: &mut StdRand) -> Option<Vec<f64>> {
     let d = set[0].vec.len();
     let base = set[rng.below(NonZeroUsize::new(set.len()).unwrap())]
         .vec
@@ -546,9 +559,11 @@ fn sample_from_kde_reflect(set: &[Trial], h: f64, rng: &mut StdRand) -> Vec<f64>
     project_vec(out)
 }
 
-pub fn project_vec(mut v: Vec<f64>) -> Vec<f64> {
+/// Project a TPE candidate vector: clamp alpha, L2-normalize weights.
+/// Returns None if the active weights have zero norm (reject/resample).
+pub fn project_vec(mut v: Vec<f64>) -> Option<Vec<f64>> {
     if v.is_empty() {
-        return v;
+        return Some(v);
     }
     v[0] = v[0].clamp(0.0, 1.0);
 
@@ -564,19 +579,13 @@ pub fn project_vec(mut v: Vec<f64>) -> Vec<f64> {
                 v[j] *= inv;
             }
         } else {
-            let active_dim = d - 1;
-            if active_dim > 0 {
-                let u = 1.0 / (active_dim as f64).sqrt();
-                for j in 1..d {
-                    v[j] = u;
-                }
-            }
+            return None;
         }
     }
-    v
+    Some(v)
 }
 
-fn jitter_and_project(v: &[f64], rng: &mut StdRand) -> Vec<f64> {
+fn jitter_and_project(v: &[f64], rng: &mut StdRand) -> Option<Vec<f64>> {
     let mut out = v.to_vec();
     for x in &mut out {
         let delta = 0.05 * (rng.next_float() as f64 - 0.5) * 2.0;

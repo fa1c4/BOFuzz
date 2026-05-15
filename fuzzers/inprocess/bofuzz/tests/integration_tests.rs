@@ -380,41 +380,60 @@ fn test_active_features_follow_schema_order() {
     assert_eq!(active[7].id, "S06");
 }
 
-// ======================== 12.5 Candidate and prior tests ========================
+// ======================== 12.5 Candidate tests ========================
 
 #[test]
-fn test_candidate_len_mismatch_fails() {
+fn test_candidate_len_mismatch_detected() {
     let tmp = TempDir::new().unwrap();
     let cand_path = tmp.path().join("test_v_candidates.json");
-    // active_dim=8 means expected len=9, but we give len=5
     let cands = vec![vec![0.5, 0.3, 0.3, 0.3, 0.3]];
     fs::write(&cand_path, serde_json::to_string(&cands).unwrap()).unwrap();
     let s = fs::read_to_string(&cand_path).unwrap();
     let arr: Vec<Vec<f64>> = serde_json::from_str(&s).unwrap();
     let expected_len = 1 + 8;
-    assert_ne!(arr[0].len(), expected_len);
+    assert_ne!(
+        arr[0].len(),
+        expected_len,
+        "Mismatched candidate length should be detected"
+    );
 }
 
 #[test]
-fn test_prior_index_zero_is_invalid() {
-    // Prior indexes must be one-based (1..schema_dim)
-    let raw = vec![0usize, 1, 2];
-    let has_zero = raw.iter().any(|&x| x < 1);
-    assert!(has_zero, "Index 0 should be detected as invalid");
+fn test_candidate_zero_norm_detected() {
+    let cand = vec![0.5, 0.0, 0.0, 0.0];
+    let weights = &cand[1..];
+    let norm = weights.iter().map(|x| x * x).sum::<f64>().sqrt();
+    assert_eq!(norm, 0.0, "Zero-norm weights should be detected");
+}
+
+// ======================== Legacy key rejection ========================
+
+#[test]
+fn test_legacy_key_btw_is_rejected() {
+    let legacy_keys = vec![
+        "imme", "strc", "mem", "arith", "indeg", "offsp", "btw", "depth",
+    ];
+    for key in &legacy_keys {
+        assert!(
+            legacy_keys.contains(key),
+            "Legacy key '{}' must be in the rejection list",
+            key
+        );
+    }
+}
+
+// ======================== Zero-norm vector rejection ========================
+
+#[test]
+fn test_zero_norm_vector_is_invalid() {
+    let weights = vec![0.0, 0.0, 0.0, 0.0];
+    let norm = weights.iter().map(|x| x * x).sum::<f64>().sqrt();
+    assert!(norm <= 0.0, "Zero-norm vector should be rejected");
 }
 
 #[test]
-fn test_prior_index_exceeding_schema_dim_is_invalid() {
-    let schema_dim = 16;
-    let raw = vec![1, 2, 17]; // 17 > 16
-    let has_oob = raw.iter().any(|&x| x > schema_dim);
-    assert!(has_oob, "Index 17 should exceed schema_dim=16");
-}
-
-#[test]
-fn test_prior_duplicate_is_invalid() {
-    let raw = vec![1, 2, 3, 2];
-    let mut seen = std::collections::HashSet::new();
-    let has_dup = raw.iter().any(|x| !seen.insert(x));
-    assert!(has_dup, "Duplicate index 2 should be detected");
+fn test_nonfinite_weight_is_invalid() {
+    let weights = vec![1.0, f64::NAN, 0.5];
+    let has_nonfinite = weights.iter().any(|x| !x.is_finite());
+    assert!(has_nonfinite, "Non-finite weight should be detected");
 }

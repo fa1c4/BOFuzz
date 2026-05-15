@@ -86,6 +86,7 @@ struct BofuzzArgs {
     feat_mode: u8,
     explore_time_secs: u64,
     tpe_period_secs: u64,
+    alpha_explicit: bool,
 }
 
 fn fmt_vec_short(v: &[f64], maxn: usize) -> String {
@@ -366,6 +367,7 @@ pub extern "C" fn libafl_main() {
     );
 
     let cli_features_path = res.get_one::<String>("features").map(PathBuf::from);
+    let alpha_explicit = res.value_source("alpha") == Some(clap::parser::ValueSource::CommandLine);
     let params = FactorParams {
         alpha: res.get_one::<String>("alpha").unwrap().parse().unwrap(),
         beta: res.get_one::<String>("beta").unwrap().parse().unwrap(),
@@ -379,6 +381,7 @@ pub extern "C" fn libafl_main() {
         feat_mode: *res.get_one::<u8>("feat-mode").unwrap(),
         explore_time_secs: *res.get_one::<u64>("explore-time-secs").unwrap(),
         tpe_period_secs: *res.get_one::<u64>("tpe-period-secs").unwrap(),
+        alpha_explicit,
     };
 
     fuzz(
@@ -569,27 +572,26 @@ fn fuzz(
     let mut has_feats = false;
 
     if let Some(p) = chosen_path.as_ref() {
-        // Validate the feature map strictly against the schema
+        // Validate and canonicalize the feature map in one pass
         match load_and_validate_feature_map(p, &schema, sancov_sites) {
-            Ok(_validated_map) => {
-                // Map validated; now load and align
+            Ok(canonical_map) => {
+                // Use the canonicalized map directly (no re-reading raw JSON)
                 match load_and_align_features_map(
                     &mut state,
-                    p,
+                    &canonical_map,
                     sancov_sites,
                     active_dim,
                     &active_names,
-                    &vec_mask,
-                    schema_dim,
+                    p,
                 ) {
-                    Ok((feats, matrix_opt)) => {
+                    Ok((feats, active_matrix)) => {
                         eprintln!("[BOFuzz] using features map: {}", p.display());
                         pending_feats = Some(feats);
-                        pending_matrix = matrix_opt;
+                        pending_matrix = Some(active_matrix);
                         has_feats = true;
                     }
                     Err(e) => {
-                        eprintln!("[BOFuzz] feature-map load failed: {}. Feature map is present but invalid — aborting.", e);
+                        eprintln!("[BOFuzz] feature-map load failed: {}. Aborting.", e);
                         process::exit(1);
                     }
                 }
@@ -621,6 +623,21 @@ fn fuzz(
         });
     }
     set_feat_exists(&mut state, has_feats);
+
+    // Alpha precedence: explicit CLI alpha > candidate alpha > default
+    if !bofuzz_args.alpha_explicit {
+        use crate::feature_sched::get_current_weight_vec;
+        let cur_v = get_current_weight_vec(&state);
+        if !cur_v.is_empty() {
+            let candidate_alpha = cur_v[0];
+            if candidate_alpha.is_finite() && candidate_alpha >= 0.0 && candidate_alpha <= 1.0 {
+                let mut params = bofuzz_args.factor_params.clone();
+                params.alpha = candidate_alpha;
+                set_factor_params(&mut state, params);
+                set_alpha_init(&mut state, candidate_alpha);
+            }
+        }
+    }
 
     set_feat_mode(&mut state, bofuzz_args.feat_mode);
     eprintln!("[BOFuzz params] feat_mode={}", bofuzz_args.feat_mode);

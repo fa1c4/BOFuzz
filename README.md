@@ -104,12 +104,10 @@ No placeholder zeros for disabled dimensions.
 ```
 If `--vec-mask` changes, candidate files must be regenerated.
 
-## Prior-Order File Format
+## Default Candidate Order
 
-`{target}_prior_order.json` uses **one-based** indexes over the full schema:
-```json
-[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-```
+BOFuzz no longer accepts user prior-order files. Default candidate order is
+deterministic: uniform first, then one-hot candidates in active schema order.
 
 ## Usage
 

@@ -8,13 +8,16 @@ use crate::feature_sched::{
 };
 use libafl::common::HasMetadata;
 use libafl::Error;
-use serde::Deserialize;
 use std::{
     collections::HashMap,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
 };
+
+const LEGACY_KEYS: &[&str] = &[
+    "imme", "strc", "mem", "arith", "indeg", "offsp", "btw", "depth",
+];
 
 pub fn load_and_validate_schema(path: &Path) -> Result<FeatureSchemaFile, String> {
     let mut f = File::open(path).map_err(|e| {
@@ -95,7 +98,7 @@ pub fn parse_vec_mask(raw: &str, schema_len: usize) -> Result<Vec<bool>, String>
             .map(|s| {
                 s.trim()
                     .parse::<u8>()
-                    .map_err(|_| format!("BOFuzz vec-mask error: non-binary value in mask"))
+                    .map_err(|_| "BOFuzz vec-mask error: non-binary value in mask".to_string())
             })
             .collect::<Result<Vec<_>, _>>()?
     } else if trimmed.contains(',') {
@@ -104,7 +107,7 @@ pub fn parse_vec_mask(raw: &str, schema_len: usize) -> Result<Vec<bool>, String>
             .map(|s| {
                 s.trim()
                     .parse::<u8>()
-                    .map_err(|_| format!("BOFuzz vec-mask error: non-binary value in mask"))
+                    .map_err(|_| "BOFuzz vec-mask error: non-binary value in mask".to_string())
             })
             .collect::<Result<Vec<_>, _>>()?
     } else {
@@ -155,23 +158,10 @@ pub fn compute_active_features(schema: &FeatureSchemaFile, mask: &[bool]) -> Vec
         .collect()
 }
 
-fn resolve_feature_key<'a>(
-    map: &'a HashMap<String, Vec<f64>>,
-    spec: &FeatureSpec,
-) -> Option<&'a str> {
-    if map.contains_key(&spec.name) {
-        return Some(unsafe { &*(spec.name.as_str() as *const str) });
-    }
-    if let Some(aliases) = &spec.aliases {
-        for alias in aliases {
-            if map.contains_key(alias) {
-                return Some(unsafe { &*(alias.as_str() as *const str) });
-            }
-        }
-    }
-    None
-}
-
+/// Load and validate a feature map, returning a canonicalized map where every
+/// key is the canonical schema feature name. Alias keys (e.g. "betweenness")
+/// are resolved to their canonical name (e.g. "centrality"). Legacy keys and
+/// unknown keys are rejected.
 pub fn load_and_validate_feature_map(
     path: &Path,
     schema: &FeatureSchemaFile,
@@ -198,51 +188,81 @@ pub fn load_and_validate_feature_map(
 
     if map.contains_key("features") {
         return Err(
-            "BOFuzz feature-map error: legacy {{\"features\": [...]}} format not supported"
+            "BOFuzz feature-map error: legacy {\"features\": [...]} format not supported"
                 .to_string(),
         );
+    }
+
+    // Build the set of allowed keys: canonical names + declared aliases
+    let mut allowed_keys: HashMap<&str, &str> = HashMap::new(); // map_key -> canonical_name
+    for spec in &schema.features {
+        allowed_keys.insert(spec.name.as_str(), spec.name.as_str());
+        if let Some(aliases) = &spec.aliases {
+            for alias in aliases {
+                allowed_keys.insert(alias.as_str(), spec.name.as_str());
+            }
+        }
+    }
+
+    // Reject legacy and unknown keys
+    for key in map.keys() {
+        if LEGACY_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "BOFuzz feature-map error: legacy key '{}' is not supported; use canonical schema feature names",
+                key
+            ));
+        }
+        if !allowed_keys.contains_key(key.as_str()) {
+            return Err(format!(
+                "BOFuzz feature-map error: unknown key '{}' not in schema",
+                key
+            ));
+        }
     }
 
     let mut result: HashMap<String, Vec<f64>> = HashMap::new();
     let mut expected_len: Option<usize> = None;
 
     for spec in &schema.features {
-        let resolved_key = {
-            let mut found: Option<String> = None;
-            if map.contains_key(&spec.name) {
-                found = Some(spec.name.clone());
-            } else if let Some(aliases) = &spec.aliases {
-                for alias in aliases {
-                    if map.contains_key(alias) {
-                        found = Some(alias.clone());
-                        break;
-                    }
-                }
-            }
-            found
+        // Resolve: try canonical name first, then aliases
+        let resolved_map_key = if map.contains_key(&spec.name) {
+            Some(spec.name.as_str())
+        } else if let Some(aliases) = &spec.aliases {
+            aliases
+                .iter()
+                .find(|a| map.contains_key(a.as_str()))
+                .map(|a| a.as_str())
+        } else {
+            None
         };
 
-        let key = resolved_key.ok_or_else(|| {
+        let map_key = resolved_map_key.ok_or_else(|| {
             format!(
                 "BOFuzz feature-map error: missing feature {} {}",
                 spec.id, spec.name
             )
         })?;
 
-        let arr_val = map.get(&key).unwrap();
+        let arr_val = map.get(map_key).unwrap();
         let arr: Vec<f64> = match arr_val {
-            serde_json::Value::Array(a) => {
-                a.iter().enumerate().map(|(i, v)| {
-                    v.as_f64().ok_or_else(|| format!(
-                        "BOFuzz feature-map error: feature {} {} contains non-numeric value at index {}",
-                        spec.id, spec.name, i
-                    ))
-                }).collect::<Result<Vec<_>, _>>()?
+            serde_json::Value::Array(a) => a
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    v.as_f64().ok_or_else(|| {
+                        format!(
+                            "BOFuzz feature-map error: feature {} {} contains non-numeric value at index {}",
+                            spec.id, spec.name, i
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(format!(
+                    "BOFuzz feature-map error: feature {} {} is not an array",
+                    spec.id, spec.name
+                ))
             }
-            _ => return Err(format!(
-                "BOFuzz feature-map error: feature {} {} is not an array",
-                spec.id, spec.name
-            )),
         };
 
         for (i, &v) in arr.iter().enumerate() {
@@ -268,6 +288,7 @@ pub fn load_and_validate_feature_map(
             _ => {}
         }
 
+        // Always store under canonical name, even if the map used an alias
         result.insert(spec.name.clone(), arr);
     }
 
@@ -312,58 +333,52 @@ fn derive_dir_and_target(p: &Path) -> Option<(PathBuf, String)> {
     }
 }
 
-fn load_prior_order_from(path: &Path, schema_dim: usize) -> Result<Vec<usize>, String> {
-    let mut f = File::open(path)
-        .map_err(|e| format!("Cannot open prior order file {}: {}", path.display(), e))?;
-    let mut s = String::new();
-    f.read_to_string(&mut s)
-        .map_err(|e| format!("Cannot read prior order file: {}", e))?;
-    let raw: Vec<usize> =
-        serde_json::from_str(&s).map_err(|e| format!("Prior order JSON parse error: {}", e))?;
-
-    let mut seen = std::collections::HashSet::new();
-    for &idx in &raw {
-        if idx < 1 {
-            return Err(format!(
-                "BOFuzz prior-order error: index 0 is invalid, prior indexes are one-based (1..{})",
-                schema_dim
-            ));
-        }
-        if idx > schema_dim {
-            return Err(format!(
-                "BOFuzz prior-order error: index {} > schema_dim {}",
-                idx, schema_dim
-            ));
-        }
-        if !seen.insert(idx) {
-            return Err(format!("BOFuzz prior-order error: duplicate index {}", idx));
-        }
-    }
-
-    Ok(raw)
-}
-
 fn load_candidates_from(path: &Path, active_dim: usize) -> Result<Vec<Vec<f64>>, String> {
-    let mut f = File::open(path)
-        .map_err(|e| format!("Cannot open candidates file {}: {}", path.display(), e))?;
+    let mut f = File::open(path).map_err(|e| {
+        format!(
+            "BOFuzz candidate error: cannot open {}: {}",
+            path.display(),
+            e
+        )
+    })?;
     let mut s = String::new();
-    f.read_to_string(&mut s)
-        .map_err(|e| format!("Cannot read candidates file: {}", e))?;
-    let arr: Vec<Vec<f64>> =
-        serde_json::from_str(&s).map_err(|e| format!("Candidates JSON parse error: {}", e))?;
+    f.read_to_string(&mut s).map_err(|e| {
+        format!(
+            "BOFuzz candidate error: cannot read {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    let arr: Vec<Vec<f64>> = serde_json::from_str(&s).map_err(|e| {
+        format!(
+            "BOFuzz candidate error: invalid JSON in {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+
+    if arr.is_empty() {
+        return Err(format!(
+            "BOFuzz candidate error: {} contains empty candidate list",
+            path.display()
+        ));
+    }
 
     let expected_len = 1 + active_dim;
     for (i, cand) in arr.iter().enumerate() {
         if cand.len() != expected_len {
             return Err(format!(
-                "BOFuzz candidate error: candidate {} has length {}, expected {} (1 + active_dim={})",
-                i, cand.len(), expected_len, active_dim
+                "BOFuzz candidate error: candidate {} length {} != expected {} (1 + active_dim={})",
+                i,
+                cand.len(),
+                expected_len,
+                active_dim
             ));
         }
         for (j, &v) in cand.iter().enumerate() {
             if !v.is_finite() {
                 return Err(format!(
-                    "BOFuzz candidate error: candidate {} has non-finite value at index {}",
+                    "BOFuzz candidate error: candidate {} contains non-finite value at index {}",
                     i, j
                 ));
             }
@@ -372,7 +387,7 @@ fn load_candidates_from(path: &Path, active_dim: usize) -> Result<Vec<Vec<f64>>,
         let norm = weights.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm == 0.0 {
             return Err(format!(
-                "BOFuzz candidate error: candidate {} has zero-norm weights",
+                "BOFuzz candidate error: candidate {} active weights have zero norm",
                 i
             ));
         }
@@ -381,96 +396,69 @@ fn load_candidates_from(path: &Path, active_dim: usize) -> Result<Vec<Vec<f64>>,
     Ok(arr)
 }
 
+fn generate_default_candidates(active_dim: usize, alpha: f64) -> Vec<Vec<f64>> {
+    let mut res = Vec::with_capacity(active_dim + 1);
+
+    // candidate 0: uniform active vector
+    let mut uniform = Vec::with_capacity(1 + active_dim);
+    uniform.push(alpha);
+    uniform.extend(uniform_vec(active_dim));
+    res.push(uniform);
+
+    // candidates 1..N: one-hot in active schema order
+    for i in 0..active_dim {
+        let mut v = Vec::with_capacity(1 + active_dim);
+        v.push(alpha);
+        v.extend(one_hot(active_dim, i));
+        res.push(v);
+    }
+
+    res
+}
+
+/// Load or generate candidate vectors. Candidate file absent -> defaults.
+/// Candidate file present but invalid -> fatal error (returns Err).
 pub fn ensure_v_candidates_for<S: HasMetadata>(
     state: &mut S,
     features_map_path: &Path,
     active_dim: usize,
-    mask: &[bool],
-    schema_dim: usize,
-) {
+) -> Result<(), String> {
     if !get_v_candidates(state).is_empty() {
-        return;
+        return Ok(());
     }
 
-    let prior_order: Vec<usize> = match derive_dir_and_target(features_map_path) {
+    let alpha0 = get_alpha_init(state);
+    let alpha = if alpha0.is_finite() { alpha0 } else { 0.5 }.clamp(0.0, 1.0);
+
+    let cands = match derive_dir_and_target(features_map_path) {
         Some((dir, tgt)) => {
-            let pri_path = dir.join(format!("{}_prior_order.json", tgt));
-            match load_prior_order_from(&pri_path, schema_dim) {
-                Ok(v) => {
-                    eprintln!("[BOFuzz] Reading prior order file: {}", pri_path.display());
-                    eprintln!("[BOFuzz] Prior Order: {:?}", v);
-                    v
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[BOFuzz] No valid prior order at {}: {}. Using default schema order.",
-                        pri_path.display(),
+            let cand_path = dir.join(format!("{}_v_candidates.json", tgt));
+            if cand_path.exists() {
+                // File exists -> must be valid, fatal on error
+                let file_cands = load_candidates_from(&cand_path, active_dim).map_err(|e| {
+                    format!(
+                        "BOFuzz candidate error: invalid {}: {}",
+                        cand_path.display(),
                         e
-                    );
-                    (1..=schema_dim).collect()
-                }
+                    )
+                })?;
+                eprintln!(
+                    "[BOFuzz] Reading v candidates file: {}",
+                    cand_path.display()
+                );
+                file_cands
+            } else {
+                eprintln!(
+                    "[BOFuzz] No v-candidates file at {}, generating defaults.",
+                    cand_path.display()
+                );
+                generate_default_candidates(active_dim, alpha)
             }
         }
         None => {
-            eprintln!("[BOFuzz] Cannot derive prior-order path, using default schema order.");
-            (1..=schema_dim).collect()
+            eprintln!("[BOFuzz] Cannot derive v-candidates path, generating defaults.");
+            generate_default_candidates(active_dim, alpha)
         }
-    };
-
-    let active_prior_indices: Vec<usize> = prior_order
-        .iter()
-        .filter(|&&one_idx| {
-            let zero_idx = one_idx - 1;
-            zero_idx < mask.len() && mask[zero_idx]
-        })
-        .map(|&one_idx| {
-            let zero_idx = one_idx - 1;
-            mask[..=zero_idx].iter().filter(|&&m| m).count() - 1
-        })
-        .collect();
-
-    let cands_from_file: Option<Vec<Vec<f64>>> = match derive_dir_and_target(features_map_path) {
-        Some((dir, tgt)) => {
-            let cand_path = dir.join(format!("{}_v_candidates.json", tgt));
-            match load_candidates_from(&cand_path, active_dim) {
-                Ok(v) if !v.is_empty() => {
-                    eprintln!(
-                        "[BOFuzz] Reading v candidates file: {}",
-                        cand_path.display()
-                    );
-                    Some(v)
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    eprintln!("[BOFuzz] v-candidates load error: {}. Using defaults.", e);
-                    None
-                }
-            }
-        }
-        None => None,
-    };
-
-    let cands = if let Some(file_cands) = cands_from_file {
-        file_cands
-    } else {
-        let alpha0 = get_alpha_init(state);
-        let alpha = if alpha0.is_finite() { alpha0 } else { 0.5 }.clamp(0.0, 1.0);
-
-        let mut res = Vec::with_capacity(active_dim + 1);
-
-        let mut uniform = Vec::with_capacity(1 + active_dim);
-        uniform.push(alpha);
-        uniform.extend(uniform_vec(active_dim));
-        res.push(uniform);
-
-        for &active_idx in &active_prior_indices {
-            let mut v = Vec::with_capacity(1 + active_dim);
-            v.push(alpha);
-            v.extend(one_hot(active_dim, active_idx));
-            res.push(v);
-        }
-
-        res
     };
 
     replace_v_candidates(state, cands);
@@ -479,8 +467,6 @@ pub fn ensure_v_candidates_for<S: HasMetadata>(
         .into_iter()
         .next()
         .unwrap_or_else(|| {
-            let alpha0 = get_alpha_init(state);
-            let alpha = if alpha0.is_finite() { alpha0 } else { 0.5 }.clamp(0.0, 1.0);
             let mut v = vec![alpha];
             v.extend(uniform_vec(active_dim));
             v
@@ -489,6 +475,8 @@ pub fn ensure_v_candidates_for<S: HasMetadata>(
     if get_current_weight_vec(state).is_empty() {
         set_current_weight_vec(state, v0);
     }
+
+    Ok(())
 }
 
 pub fn combine_feature_matrix_to_weights(
@@ -501,16 +489,27 @@ pub fn combine_feature_matrix_to_weights(
         return Vec::new();
     }
     let inv_sqrt_d = 1.0f64 / (d as f64).sqrt();
-    let v = prepare_v(v_in, d);
+
+    // Normalize the input weight vector
+    let mut v = vec![0.0; d];
+    let n = d.min(v_in.len());
+    v[..n].copy_from_slice(&v_in[..n]);
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for w in v.iter_mut() {
+            *w /= norm;
+        }
+    } else {
+        v = uniform_vec(d);
+    }
 
     let expected_len = map
         .get(&active_feature_names[0])
         .map(|a| a.len())
         .unwrap_or(0);
-    let n = expected_len;
 
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
+    let mut out = Vec::with_capacity(expected_len);
+    for i in 0..expected_len {
         let mut z = vec![0.0f64; d];
         for (j, name) in active_feature_names.iter().enumerate() {
             if let Some(arr) = map.get(name) {
@@ -525,71 +524,39 @@ pub fn combine_feature_matrix_to_weights(
     out
 }
 
-fn prepare_v(v_raw: &[f64], d: usize) -> Vec<f64> {
-    let mut v = vec![0.0; d];
-    let n = d.min(v_raw.len());
-    for i in 0..n {
-        let mut w = v_raw[i];
-        if !w.is_finite() {
-            w = 0.0;
+/// Filter a full canonicalized feature map to contain only active features.
+fn filter_active_features(
+    full_map: &HashMap<String, Vec<f64>>,
+    active_feature_names: &[String],
+) -> HashMap<String, Vec<f64>> {
+    let mut active_map = HashMap::new();
+    for name in active_feature_names {
+        if let Some(arr) = full_map.get(name) {
+            active_map.insert(name.clone(), arr.clone());
         }
-        if w < 0.0 {
-            w = 0.0;
-        }
-        if w > 1.0 {
-            w = 1.0;
-        }
-        v[i] = w;
     }
-    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-    if norm > 0.0 {
-        for w in v.iter_mut() {
-            *w /= norm;
-        }
-        v
-    } else {
-        uniform_vec(d)
-    }
-}
-
-fn align(mut v: Vec<f64>, sites: usize) -> Vec<f64> {
-    if v.len() < sites {
-        v.resize(sites, 0.0);
-    }
-    if v.len() > sites {
-        v.truncate(sites);
-    }
-    v
+    active_map
 }
 
 pub fn load_and_align_features_map<S: HasMetadata>(
     state: &mut S,
-    path: &Path,
+    canonical_map: &HashMap<String, Vec<f64>>,
     sites: usize,
     active_dim: usize,
     active_feature_names: &[String],
-    mask: &[bool],
-    schema_dim: usize,
-) -> std::io::Result<(Vec<f64>, Option<HashMap<String, Vec<f64>>>)> {
-    ensure_v_candidates_for(state, path, active_dim, mask, schema_dim);
+    features_map_path: &Path,
+) -> Result<(Vec<f64>, HashMap<String, Vec<f64>>), String> {
+    ensure_v_candidates_for(state, features_map_path, active_dim)?;
 
     let v0_active: Vec<f64> = get_v_candidates(state)
         .first()
         .map(|v| v[1..].to_vec())
         .unwrap_or_else(|| uniform_vec(active_dim));
 
-    let mut f = File::open(path)?;
-    let mut s = String::new();
-    f.read_to_string(&mut s)?;
+    // Build active-only map from canonicalized full map
+    let active_map = filter_active_features(canonical_map, active_feature_names);
 
-    let map: HashMap<String, Vec<f64>> = serde_json::from_str(&s).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("json parse err: {e}"),
-        )
-    })?;
-
-    let feats = combine_feature_matrix_to_weights(&map, &v0_active, active_feature_names);
+    let feats = combine_feature_matrix_to_weights(&active_map, &v0_active, active_feature_names);
 
     set_tpe_satisfied(state, true);
     let alpha = get_factor_params(state).alpha;
@@ -598,15 +565,51 @@ pub fn load_and_align_features_map<S: HasMetadata>(
     v_full.extend_from_slice(&v0_active);
     set_current_weight_vec(state, v_full);
 
-    Ok((align(feats, sites), Some(map)))
+    // Resize feats to match sites
+    let mut aligned = feats;
+    aligned.resize(sites, 0.0);
+    aligned.truncate(sites);
+
+    Ok((aligned, active_map))
 }
 
+/// Apply a weight vector to recompute the features map. Strict validation:
+/// rejects wrong length, non-finite values, and zero-norm weights.
 pub fn apply_v_to_features<S: HasMetadata>(state: &mut S, v: &[f64]) -> Result<(), Error> {
+    let active_dim = get_active_dim(state);
     let active_names = get_active_feature_names(state);
+
+    if v.len() != active_dim {
+        return Err(Error::illegal_argument(format!(
+            "BOFuzz vector error: weight length {} != active_dim {}",
+            v.len(),
+            active_dim
+        )));
+    }
+
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err(Error::illegal_argument(
+            "BOFuzz vector error: non-finite active weight".to_string(),
+        ));
+    }
+
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm <= 0.0 {
+        return Err(Error::illegal_argument(
+            "BOFuzz vector error: active weights have zero norm".to_string(),
+        ));
+    }
+
+    // Normalize weights
+    let mut normalized = v.to_vec();
+    let inv = 1.0 / norm;
+    for w in normalized.iter_mut() {
+        *w *= inv;
+    }
 
     let (feats, sites) = match state.metadata_map().get::<FeaturesMatrixMeta>() {
         Some(m) => {
-            let feats = combine_feature_matrix_to_weights(&m.matrix, v, &active_names);
+            let feats = combine_feature_matrix_to_weights(&m.matrix, &normalized, &active_names);
             (feats, m.sites)
         }
         None => {
@@ -620,7 +623,10 @@ pub fn apply_v_to_features<S: HasMetadata>(state: &mut S, v: &[f64]) -> Result<(
         }
     };
 
-    let aligned = align(feats, sites);
+    let mut aligned = feats;
+    aligned.resize(sites, 0.0);
+    aligned.truncate(sites);
+
     if state.metadata_map().get::<FeaturesMapMeta>().is_some() {
         let m = state
             .metadata_map_mut()
@@ -631,13 +637,11 @@ pub fn apply_v_to_features<S: HasMetadata>(state: &mut S, v: &[f64]) -> Result<(
         state.add_metadata(FeaturesMapMeta { feats: aligned });
     }
 
-    if !v.is_empty() {
-        let alpha = get_factor_params(state).alpha;
-        let mut v_full = Vec::with_capacity(1 + v.len());
-        v_full.push(alpha.clamp(0.0, 1.0));
-        v_full.extend(v);
-        set_current_weight_vec(state, v_full);
-    }
+    let alpha = get_factor_params(state).alpha;
+    let mut v_full = Vec::with_capacity(1 + v.len());
+    v_full.push(alpha.clamp(0.0, 1.0));
+    v_full.extend(v);
+    set_current_weight_vec(state, v_full);
 
     Ok(())
 }
