@@ -8,6 +8,9 @@ fuzzers/inprocess/**
 # ignore plans
 plans/
 
+# ignore benchs
+benchs/
+
 # original ignore
 target
 target-bin

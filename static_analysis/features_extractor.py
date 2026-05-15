@@ -5,18 +5,108 @@ USING ONLY the target-binary-exclusive CFG/CG (reachable from LLVMFuzzerTestOneI
 
 Canonical 16-feature basic-block static extractor (schema v3).
 
-No external deps. Designed for IDA Pro (tested on Python 3 IDAPython).
+No external deps. Designed for IDA Pro. Supports two execution modes:
+
+  Mode A: Traditional IDA internal execution
+    /path/to/idat64 -A -Sstatic_analysis/features_extractor.py <binary>
+
+  Mode B: PyPI ``idapro`` / IDALIB external Python execution
+    python3 static_analysis/features_extractor.py --idapro \
+        --input-file <binary> --ida-dir <ida_install_dir>
+
+Top-level imports are restricted to the Python standard library so that
+``python3 static_analysis/features_extractor.py --help`` works outside IDA
+without importing ``idaapi``.
+
+USAGE:
+cd ~/BOFuzz
+# Acceptance #1 — outside-IDA --help
+python3 static_analysis/features_extractor.py --help
+
+# Acceptance #2 + #8/#9 — Mode B with --output-dir
+python3 static_analysis/features_extractor.py --idapro --ida-dir /data/zym/ida-pro-9.3 \
+  --input-file benchs/lcms/cms_transform_fuzzer --output-dir /tmp/cms_features
+#  -> 20 files in /tmp/cms_features/
+#  -> merged map has 16 keys, every array length 7713 (matches collected PCs)
+#  -> schema execution.mode == "idapro"
+
+# Default-dir variant — outputs go to benchs/lcms/
+python3 static_analysis/features_extractor.py --idapro --ida-dir /data/zym/ida-pro-9.3 \
+  --input-file benchs/lcms/cms_transform_fuzzer
+#  -> outputs land in /data/zym/BOFuzz/benchs/lcms/
 """
 
-import os, json, math, time, logging
+import argparse
+import os
+import sys
+import json
+import math
+import time
+import logging
 from collections import defaultdict, deque
 
-import idaapi
-import idc
-import ida_bytes
-import ida_nalt
-import ida_segment
-import idautils
+# ============================ IDA MODULES ============================
+# These are populated lazily by import_ida_modules() once we know whether
+# we are running inside IDA (Mode A) or under PyPI idapro / IDALIB (Mode B).
+idaapi = None
+idc = None
+ida_bytes = None
+ida_nalt = None
+ida_segment = None
+idautils = None
+ida_auto = None
+
+# Execution-state globals.
+_IDAPRO_LIB = None
+_IDAPRO_DB_OPENED = False
+_IDAPRO_CLOSE_SAVE = False
+_RUNNING_UNDER_IDAPRO = False
+_RUNNING_INSIDE_IDA = False
+
+# Lazily populated set of operand types treated as referenceable; filled in
+# by import_ida_modules() because it depends on idaapi constants.
+_REF_OPERAND_TYPES = None
+
+
+def import_ida_modules():
+    """Import IDA Python modules and stash them in module globals.
+
+    Also initialises ``_REF_OPERAND_TYPES`` which depends on idaapi constants.
+    Safe to call multiple times; later calls just re-bind the same modules.
+
+    Note: ``import idapro`` (PyPI IDALIB) has the side-effect of dumping many
+    IDA names (including the ``idaapi`` / ``idc`` / ``ida_auto`` / ``ida_bytes``
+    / ``ida_nalt`` / ``ida_segment`` modules) directly into our module's
+    globals, but it does NOT export ``idautils``. So we cannot use the state
+    of these globals as a "have we imported yet?" guard.
+    """
+    global idaapi, idc, ida_bytes, ida_nalt, ida_segment, idautils, ida_auto
+    global _REF_OPERAND_TYPES
+
+    import idaapi as _idaapi
+    import idc as _idc
+    import ida_bytes as _ida_bytes
+    import ida_nalt as _ida_nalt
+    import ida_segment as _ida_segment
+    import idautils as _idautils
+    import ida_auto as _ida_auto
+
+    idaapi = _idaapi
+    idc = _idc
+    ida_bytes = _ida_bytes
+    ida_nalt = _ida_nalt
+    ida_segment = _ida_segment
+    idautils = _idautils
+    ida_auto = _ida_auto
+
+    _REF_OPERAND_TYPES = {
+        idaapi.o_imm,
+        idaapi.o_mem,
+        idaapi.o_displ,
+        idaapi.o_near,
+        idaapi.o_far,
+    }
+
 
 # ============================= CONFIG =============================
 SEED_ENTRY_NAMES = [
@@ -458,7 +548,8 @@ def is_call_inst(mnem):
     return mnem in {"call", "callq"} or mnem.startswith("call")
 
 # ======================= UNIFIED INSTRUCTION FEATURE EXTRACTOR =======================
-_REF_OPERAND_TYPES = {idaapi.o_imm, idaapi.o_mem, idaapi.o_displ, idaapi.o_near, idaapi.o_far}
+# _REF_OPERAND_TYPES is populated by import_ida_modules() because it depends
+# on idaapi constants which are unavailable at module import time outside IDA.
 
 def extract_instruction_features(ea, string_addrs):
     """
@@ -784,7 +875,20 @@ def function_filter(f):
     except Exception:
         return False
 
+_TAIL_CALL_JUMP_MNEMS = {"jmp", "jmpq"}
+
+
 def build_function_call_graph():
+    """Build a function-level call graph for reachability from seeds.
+
+    Records two kinds of edges:
+      * Direct calls (``call`` / ``callq`` etc.).
+      * Tail-call jumps: an unconditional ``jmp`` whose target is the
+        ENTRY of a different function. Clang routinely emits these
+        for ``LLVMFuzzerTestOneInput`` wrappers and many small thunks;
+        if we don't follow them, reachability collapses to just the
+        wrapper itself.
+    """
     call_graph = defaultdict(set)
     funcs = [f for f in idautils.Functions() if function_filter(f)]
     for f in funcs:
@@ -796,7 +900,9 @@ def build_function_call_graph():
         cur = ea
         while cur < end and cur != idc.BADADDR:
             m = get_base_mnemonic(cur)
-            if is_call_inst(m):
+            is_call = is_call_inst(m)
+            is_uncond_jmp = m in _TAIL_CALL_JUMP_MNEMS
+            if is_call or is_uncond_jmp:
                 targets = set()
                 try:
                     for r in idautils.CodeRefsFrom(cur, False):
@@ -810,7 +916,18 @@ def build_function_call_graph():
                         targets.add(tgt)
                 for tgt in targets:
                     tgt_fn = idaapi.get_func(tgt)
-                    if tgt_fn and function_filter(tgt_fn.start_ea):
+                    if not tgt_fn:
+                        continue
+                    if is_uncond_jmp:
+                        # Only treat ``jmp`` as a tail call when it lands
+                        # exactly on a DIFFERENT function's entry. Intra-
+                        # function ``jmp`` to a basic block is a regular
+                        # CFG edge and must not pollute the call graph.
+                        if tgt_fn.start_ea != tgt:
+                            continue
+                        if tgt_fn.start_ea == fn.start_ea:
+                            continue
+                    if function_filter(tgt_fn.start_ea):
                         call_graph[ea].add(tgt_fn.start_ea)
             cur = idc.next_head(cur)
             if cur == idc.BADADDR:
@@ -1415,10 +1532,22 @@ def validate_exported_maps(attr_arrays, pcs):
                 raise RuntimeError("non-finite value in feature array: %s" % name)
 
 # ======================= EXPORT =======================
-def build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges=None):
+def _cross_platform_basename(path):
+    """Return the basename of ``path`` treating both '/' and '\\\\' as separators.
+
+    Needed because ``ida_nalt.get_input_file_path()`` can return Windows-style
+    paths when the IDB was originally created on Windows.
+    """
+    if not path:
+        return path
+    return os.path.basename(path.replace("\\", "/"))
+
+
+def build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges=None,
+                                 out_dir_override=None, base_override=None):
     bin_path = ida_nalt.get_input_file_path()
-    base = os.path.basename(bin_path)
-    out_dir = os.path.dirname(bin_path) or os.getcwd()
+    base = base_override or _cross_platform_basename(bin_path)
+    out_dir = out_dir_override or os.path.dirname(bin_path) or os.getcwd()
 
     bb_cache = BBCache()
 
@@ -1499,9 +1628,10 @@ def build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges=No
 
     return out_path, dbg_path
 
-def build_and_save_features_map_for_u(pcs, blocks, func_of_bb, u, out_filename):
+def build_and_save_features_map_for_u(pcs, blocks, func_of_bb, u, out_filename,
+                                       out_dir_override=None):
     bin_path = ida_nalt.get_input_file_path()
-    out_dir = os.path.dirname(bin_path) or os.getcwd()
+    out_dir = out_dir_override or os.path.dirname(bin_path) or os.getcwd()
 
     bb_cache = BBCache()
     target_bb_set = set(blocks.keys())
@@ -1529,7 +1659,9 @@ def build_and_save_features_map_for_u(pcs, blocks, func_of_bb, u, out_filename):
         print(f"[+] Saved features_map (u provided) -> {out_path}")
     return fmap, out_path
 
-def save_schema_json(out_dir, base):
+def save_schema_json(out_dir, base, execution=None, out_dir_override=None):
+    if out_dir_override:
+        out_dir = out_dir_override
     schema = {
         "schema_version": FEATURE_SCHEMA_VERSION,
         "feature_count": len(ATTR_NAMES),
@@ -1560,8 +1692,11 @@ def save_schema_json(out_dir, base):
             "mem_inst_count counts explicit memory-access instructions only",
             "calls are counted in call_count only",
             "APageRank disabled by default",
+            "If --input-file points to a .i64 database, output basename may include the .i64 suffix",
         ],
     }
+    if execution is not None:
+        schema["execution"] = execution
     schema_path = os.path.join(out_dir, f"{base}_features_schema.json")
     with open(schema_path, "w") as f:
         json.dump(schema, f, indent=2)
@@ -1569,8 +1704,204 @@ def save_schema_json(out_dir, base):
         print(f"[+] Saved schema JSON -> {schema_path}")
     return schema_path
 
-# ============================== MAIN ==============================
-def main():
+# ============================== CLI / BOOTSTRAP ==============================
+def parse_cli_args(argv):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extract canonical BOFuzz 16-dim static BB features using IDA/IDALIB. "
+            "Supports both --idapro (PyPI idapro / IDALIB) and traditional IDA -S."
+        )
+    )
+    parser.add_argument(
+        "--idapro",
+        action="store_true",
+        help="Run via PyPI idapro / IDALIB instead of inside IDA.",
+    )
+    parser.add_argument(
+        "-i", "--input-file",
+        default=None,
+        help="Path to target binary (required when --idapro is used).",
+    )
+    parser.add_argument(
+        "--ida-dir",
+        default=None,
+        help="IDA installation directory; sets IDADIR before importing idapro.",
+    )
+    parser.add_argument(
+        "--save-idb",
+        action="store_true",
+        help="If set, save the IDB on close (Mode B only).",
+    )
+    parser.add_argument(
+        "--no-auto-wait",
+        action="store_true",
+        help="Skip ida_auto.auto_wait() after database open / module import.",
+    )
+    parser.add_argument(
+        "--feature-mode",
+        choices=["both", "semantic", "graph"],
+        default="both",
+        help="Which feature groups to keep before normalization.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory to write feature outputs into. Defaults to dirname(input file).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging.",
+    )
+    return parser.parse_args(argv)
+
+
+def _detect_inside_ida():
+    """Return True if we appear to be already running inside IDA (Mode A)."""
+    return "idaapi" in sys.modules or "idc" in sys.modules
+
+
+def bootstrap_ida_environment(args):
+    """Bring up IDA modules according to the selected execution mode.
+
+    Mode B (--idapro): set IDADIR, import idapro, open the database, then
+                       import IDA modules and (optionally) run auto_wait.
+    Mode A (default):  expect to be running inside IDA already; import IDA
+                       modules and (optionally) run auto_wait.
+    """
+    global _IDAPRO_LIB, _IDAPRO_DB_OPENED, _IDAPRO_CLOSE_SAVE
+    global _RUNNING_UNDER_IDAPRO, _RUNNING_INSIDE_IDA
+
+    if args.ida_dir:
+        os.environ["IDADIR"] = args.ida_dir
+
+    if args.idapro:
+        if not args.input_file:
+            raise RuntimeError("--input-file is required when --idapro is used")
+
+        try:
+            import idapro as _idapro
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to import the PyPI 'idapro' module. Make sure IDALIB is "
+                "installed (e.g. via py-activate-idalib.py) and that --ida-dir "
+                "points at a valid IDA installation. Original error: %r" % (e,)
+            )
+
+        _IDAPRO_LIB = _idapro
+        _RUNNING_UNDER_IDAPRO = True
+        _IDAPRO_CLOSE_SAVE = bool(args.save_idb)
+
+        rc = _idapro.open_database(args.input_file, True)
+        if rc != 0:
+            raise RuntimeError(
+                "idapro.open_database failed with rc=%r for %s"
+                % (rc, args.input_file)
+            )
+        _IDAPRO_DB_OPENED = True
+
+        import_ida_modules()
+
+        if not args.no_auto_wait:
+            ida_auto.auto_wait()
+        return
+
+    try:
+        import_ida_modules()
+        _RUNNING_INSIDE_IDA = True
+
+        if not args.no_auto_wait:
+            ida_auto.auto_wait()
+        return
+    except Exception as e:
+        raise RuntimeError(
+            "Could not import IDA modules. If running outside IDA, use: "
+            "python3 static_analysis/features_extractor.py "
+            "--idapro --input-file <binary> --ida-dir <ida_install_dir>. "
+            "Original error: %r" % (e,)
+        )
+
+
+def cleanup_ida_environment():
+    """Close the idapro-managed database, if any. No-op in traditional mode."""
+    global _IDAPRO_LIB, _IDAPRO_DB_OPENED
+
+    if _IDAPRO_LIB is not None and _IDAPRO_DB_OPENED:
+        try:
+            _IDAPRO_LIB.close_database(bool(_IDAPRO_CLOSE_SAVE))
+        finally:
+            _IDAPRO_DB_OPENED = False
+
+
+# ========================== OUTPUT DIRECTORY HELPERS ==========================
+def get_output_dir(args):
+    """Resolve the absolute output directory based on CLI args and IDA state.
+
+    Resolution order:
+      1. ``--output-dir`` if provided.
+      2. ``dirname(args.input_file)`` if ``--input-file`` was provided
+         (preferred in Mode B, especially when the IDB stores a non-portable
+         Windows path that ``ida_nalt.get_input_file_path()`` would return).
+      3. ``dirname(ida_nalt.get_input_file_path())`` (traditional Mode A).
+      4. The current working directory.
+    """
+    if args is not None and getattr(args, "output_dir", None):
+        out_dir = os.path.abspath(args.output_dir)
+        if not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        return out_dir
+
+    if args is not None and getattr(args, "input_file", None):
+        in_dir = os.path.dirname(os.path.abspath(args.input_file))
+        if in_dir:
+            return in_dir
+
+    bin_path = ida_nalt.get_input_file_path() if ida_nalt is not None else None
+    if bin_path:
+        bin_dir = os.path.dirname(bin_path.replace("\\", "/"))
+        if bin_dir:
+            return bin_dir
+    return os.getcwd()
+
+
+def _build_execution_metadata(args, bin_path, out_dir):
+    """Build the execution metadata dict embedded in features_schema.json."""
+    if _RUNNING_UNDER_IDAPRO:
+        mode = "idapro"
+    elif _RUNNING_INSIDE_IDA:
+        mode = "ida_internal"
+    else:
+        mode = "unknown"
+
+    meta = {
+        "mode": mode,
+        "cwd": os.getcwd(),
+        "auto_wait": not bool(getattr(args, "no_auto_wait", False)),
+        "output_dir": out_dir,
+        "feature_mode": getattr(args, "feature_mode", "both"),
+    }
+
+    if mode == "idapro":
+        input_file_arg = getattr(args, "input_file", None)
+        meta.update({
+            "input_file_arg": input_file_arg,
+            "resolved_input_file": os.path.abspath(input_file_arg) if input_file_arg else None,
+            "ida_dir": getattr(args, "ida_dir", None) or os.environ.get("IDADIR"),
+            "save_idb": bool(getattr(args, "save_idb", False)),
+            "input_file_path": bin_path,
+        })
+    else:
+        meta["input_file_path"] = bin_path
+
+    return meta
+
+
+# ============================== EXTRACTION ==============================
+def run_extraction(args):
+    """Run the full extraction pipeline. Assumes IDA modules are imported."""
+    if getattr(args, "verbose", False):
+        log.setLevel(logging.DEBUG)
+
     time_start = time.time()
     bin_path = ida_nalt.get_input_file_path()
     print(f"[+] Binary: {bin_path}")
@@ -1609,7 +1940,7 @@ def main():
     print("[+] Computing centrality (betweenness) ...")
     compute_centrality_feature(CFG, blocks)
 
-    feature = 'both'
+    feature = args.feature_mode
     apply_feature_mode(blocks, feature=feature)
     print(f"[+] Feature mode: {feature}")
 
@@ -1635,8 +1966,16 @@ def main():
     if VERBOSE:
         print(f"[+] Reachable edges from entries: {reachable_edges}")
 
-    base = os.path.basename(bin_path)
-    out_dir = os.path.dirname(bin_path) or os.getcwd()
+    # Choose the base name preferring the user-supplied --input-file when in
+    # Mode B (avoids leaking Windows paths from older IDBs into output files).
+    base = None
+    if getattr(args, "input_file", None):
+        base = _cross_platform_basename(args.input_file)
+    if not base:
+        base = _cross_platform_basename(bin_path)
+
+    out_dir_override = get_output_dir(args)
+    out_dir = out_dir_override
 
     attr_arrays = {}
     dim = len(ATTR_NAMES)
@@ -1644,7 +1983,10 @@ def main():
         u_one_hot = [0.0] * dim
         u_one_hot[i] = 1.0
         out_file = f"{base}_features_map_{name}.json"
-        fmap, _ = build_and_save_features_map_for_u(pcs, blocks, func_of_bb, u_one_hot, out_file)
+        fmap, _ = build_and_save_features_map_for_u(
+            pcs, blocks, func_of_bb, u_one_hot, out_file,
+            out_dir_override=out_dir_override,
+        )
         attr_arrays[name] = fmap
 
     validate_exported_maps(attr_arrays, pcs)
@@ -1655,9 +1997,14 @@ def main():
     if VERBOSE:
         print(f"[+] Saved merged 16-key features_map -> {merged_path}")
 
-    out_map, out_dbg = build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges)
+    out_map, out_dbg = build_and_save_features_map(
+        pcs, CFG, blocks, func_of_bb, reachable_edges,
+        out_dir_override=out_dir_override, base_override=base,
+    )
 
-    schema_path = save_schema_json(out_dir, base)
+    execution = _build_execution_metadata(args, bin_path, out_dir)
+    execution["output_basename"] = base
+    schema_path = save_schema_json(out_dir, base, execution=execution)
 
     time_end = time.time()
     print(f"\n[+] DONE.")
@@ -1669,7 +2016,27 @@ def main():
     print(f"    Debug          : {out_dbg}")
     print(f"    Schema         : {schema_path}")
     print(f"    APageRank      : {'enabled' if USE_APAGERANK else 'disabled'}")
+    print(f"    Mode           : {execution['mode']}")
     print(f"    Time           : {(time_end - time_start):.2f}s")
+
+
+# ============================== MAIN ==============================
+def main(args=None):
+    if args is None:
+        # When invoked by IDA via the -S flag, sys.argv often contains IDA's
+        # own arguments (script path, IDB, etc.) which are not valid for our
+        # argparse. Detect that case and use an empty arg list instead.
+        if _detect_inside_ida():
+            args = parse_cli_args([])
+        else:
+            args = parse_cli_args(sys.argv[1:])
+
+    bootstrap_ida_environment(args)
+
+    try:
+        return run_extraction(args)
+    finally:
+        cleanup_ida_environment()
 
 
 if __name__ == "__main__":
