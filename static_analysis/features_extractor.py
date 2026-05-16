@@ -247,9 +247,18 @@ def get_base_mnemonic(addr):
     return m
 
 def finite_or_zero(x):
-    if math.isnan(x) or math.isinf(x):
+    """Coerce ``x`` to a finite float, returning 0.0 on failure.
+
+    Accepts ints/floats/strings; non-finite (NaN/inf) values become 0.0.
+    Used pervasively by the ACFG statistics / Voronoi aggregation pipeline.
+    """
+    try:
+        v = float(x)
+    except Exception:
         return 0.0
-    return float(x)
+    if not math.isfinite(v):
+        return 0.0
+    return v
 
 def get_arch_bits():
     try:
@@ -1409,6 +1418,926 @@ def count_reachable_edges(CFG, func_of_bb, target_funcs):
 
     return int(total_edges)
 
+# ======================= ACFG CONSTRUCTION HELPERS =======================
+# All helpers below operate on plain Python data (CFG dicts, ``blocks``
+# mapping ``ea -> BBlock``, schema feature specs). They contain no IDA
+# dependency so they can be exercised by ``--self-test-acfg-stats``.
+
+def build_acfg_index(blocks):
+    """Assign deterministic stable ACFG node indexes.
+
+    Sorted by basic-block start address so indexes are reproducible
+    across runs and binaries.
+
+    Returns ``(node_order, node_index)`` where ``node_order`` is a list
+    of basic-block start addresses and ``node_index[ea] = i``.
+    """
+    node_order = sorted(blocks.keys())
+    node_index = {ea: i for i, ea in enumerate(node_order)}
+    return node_order, node_index
+
+
+def build_acfg_adjacency(cfg, node_index, edge_mode="directed"):
+    """Build the ACFG adjacency used by Moran's I.
+
+    For CFG edge ``u -> v`` (both endpoints in ``node_index``):
+
+      * ``directed``   -> ``w_uv = 1``, ``w_vu = 0``
+      * ``undirected`` -> ``w_uv = 1``, ``w_vu = 1`` (symmetrized)
+
+    Self-loops are dropped.
+    """
+    adj = defaultdict(set)
+    for src, dsts in cfg.items():
+        if src not in node_index:
+            continue
+        i = node_index[src]
+        for dst in dsts:
+            if dst not in node_index:
+                continue
+            if src == dst:
+                continue
+            k = node_index[dst]
+            adj[i].add(k)
+            if edge_mode == "undirected":
+                adj[k].add(i)
+    return {i: sorted(vs) for i, vs in adj.items()}
+
+
+def build_voronoi_adjacency(cfg, node_index):
+    """Directed-successor adjacency for Voronoi region assignment.
+
+    Only includes the forward CFG edge ``u -> v`` (never the reverse).
+    Self-loops are dropped.
+    """
+    adj = defaultdict(set)
+    for src, dsts in cfg.items():
+        if src not in node_index:
+            continue
+        i = node_index[src]
+        for dst in dsts:
+            if dst not in node_index:
+                continue
+            if src == dst:
+                continue
+            adj[i].add(node_index[dst])
+    return {i: sorted(vs) for i, vs in adj.items()}
+
+
+# ======================= STATISTICS HELPERS =======================
+def get_acfg_feature_signal(blocks, node_order, feature_name, signal_source="norm"):
+    """Return the per-node feature signal list in ACFG node order."""
+    values = []
+    for ea in node_order:
+        block = blocks[ea]
+        if signal_source == "raw":
+            value = block.raw_attrs.get(feature_name, 0.0)
+        else:
+            value = block.norm_attrs.get(feature_name, 0.0)
+        values.append(finite_or_zero(value))
+    return values
+
+
+def to_strength_signal(xs, eps=1e-8):
+    """Convert raw/normalized values to non-negative strength ``z``.
+
+    Near-zero magnitudes (|x| <= eps) collapse to 0 to suppress
+    floating-point noise.
+    """
+    zs = []
+    for x in xs:
+        v = abs(finite_or_zero(x))
+        if v <= eps:
+            v = 0.0
+        zs.append(v)
+    return zs
+
+
+def average_ranks(values):
+    """1-based average ranks with tie-handling. All ranks are finite."""
+    n = len(values)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: values[i])
+    ranks = [0.0] * n
+    pos = 0
+    while pos < n:
+        end = pos + 1
+        while end < n and values[order[end]] == values[order[pos]]:
+            end += 1
+        avg_rank = (pos + 1 + end) / 2.0
+        for q in range(pos, end):
+            ranks[order[q]] = avg_rank
+        pos = end
+    return ranks
+
+
+def moran_i(y, adj):
+    """Compute Moran's I given signal ``y`` and adjacency ``adj``.
+
+    ``adj`` is ``{i: [neighbors...]}``. Self-loops must already be removed.
+    Returns 0 for degenerate graphs (empty / no edges / constant signal).
+    Negative values are NOT clamped.
+    """
+    n = len(y)
+    if n == 0:
+        return 0.0
+    s0 = 0
+    for vs in adj.values():
+        s0 += len(vs)
+    if s0 <= 0:
+        return 0.0
+    mean_y = sum(y) / float(n)
+    denom = sum((v - mean_y) ** 2 for v in y)
+    if denom <= 1e-12:
+        return 0.0
+    num = 0.0
+    for i, neighs in adj.items():
+        yi = y[i] - mean_y
+        for k in neighs:
+            num += yi * (y[k] - mean_y)
+    result = (float(n) / float(s0)) * (num / denom)
+    return finite_or_zero(result)
+
+
+def gini_coefficient(values):
+    """Sorted-form Gini coefficient on non-negative strength values.
+
+    Returns 0 for empty input or all-zero strength. Small negative
+    artefacts close to zero are clamped to 0; otherwise the raw result
+    is returned (typically within ``[0, 1]``).
+    """
+    xs = sorted(max(0.0, finite_or_zero(v)) for v in values)
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    total = sum(xs)
+    if total <= 1e-12:
+        return 0.0
+    weighted = 0.0
+    for idx, val in enumerate(xs, start=1):
+        weighted += idx * val
+    g = (2.0 * weighted) / (n * total) - (n + 1.0) / n
+    if -1e-12 < g < 0.0:
+        g = 0.0
+    return finite_or_zero(g)
+
+
+def compute_acfg_feature_statistics(blocks, schema_features, node_order, adj,
+                                     signal_source="norm", eps=1e-8,
+                                     edge_mode="directed"):
+    """Per-feature MoranI(rank(z)) / Gini(z) / signed ACFG-RDS.
+
+    Returns ``(stats, ranked)`` where ``stats`` follows schema order and
+    ``ranked`` sorts ``stats`` by ``abs(acfg_rds)`` descending and adds
+    ``rank_by_abs_acfg_rds``.
+    """
+    n_nodes = len(node_order)
+    n_edges = sum(len(vs) for vs in adj.values())
+
+    stats = []
+    for spec in schema_features:
+        feature_id = spec["id"]
+        feature_name = spec["name"]
+        group = spec.get("group")
+
+        x = get_acfg_feature_signal(blocks, node_order, feature_name, signal_source)
+        z = to_strength_signal(x, eps)
+        r = average_ranks(z)
+
+        mi = moran_i(r, adj)
+        g = gini_coefficient(z)
+        rds = finite_or_zero(mi * g)
+
+        active_count = sum(1 for v in z if v > 0.0)
+        active_rate = (active_count / float(n_nodes)) if n_nodes > 0 else 0.0
+
+        if rds > 0:
+            sign = "positive"
+        elif rds < 0:
+            sign = "negative"
+        else:
+            sign = "zero"
+
+        stats.append({
+            "feature_id": feature_id,
+            "feature_name": feature_name,
+            "group": group,
+            "n_blocks": n_nodes,
+            "n_edges": n_edges,
+            "edge_mode": edge_mode,
+            "active_count": active_count,
+            "active_rate": finite_or_zero(active_rate),
+            "moran_i_rank_strength": finite_or_zero(mi),
+            "gini_strength": finite_or_zero(g),
+            "acfg_rds": rds,
+            "abs_acfg_rds": finite_or_zero(abs(rds)),
+            "sign": sign,
+        })
+
+    # Rank by abs(acfg_rds) descending; deterministic tie-break on feature_id.
+    ranked = sorted(
+        stats,
+        key=lambda row: (-row["abs_acfg_rds"], row["feature_id"]),
+    )
+    for idx, row in enumerate(ranked, start=1):
+        row["rank_by_abs_acfg_rds"] = idx
+    # Backfill rank into the schema-ordered list too (rows are shared dicts).
+    return stats, ranked
+
+
+def vec_mask_from_feature_ids(schema_features, selected_feature_ids):
+    """Build a 0/1 string of len(schema_features) marking selected ids."""
+    selected = set(selected_feature_ids)
+    return "".join("1" if spec["id"] in selected else "0" for spec in schema_features)
+
+
+# ======================= ACFG VORONOI HELPERS =======================
+def build_sancov_seed_nodes(pcs, bb_cache, blocks, node_index):
+    """Map sancov PCs to ACFG seed nodes.
+
+    Returns a list of seed records, one per sancov index, with
+    ``node_index = None`` when the PC's containing basic block is not
+    a target-only ACFG block (or no block was found at all).
+    """
+    seeds = []
+    for sancov_index, pc in enumerate(pcs):
+        bb = bb_cache.find_block(pc)
+        if bb is None:
+            seeds.append({
+                "sancov_index": sancov_index,
+                "pc": hex(pc),
+                "bb_start": None,
+                "node_index": None,
+                "note": "no_bb",
+            })
+            continue
+        start = bb.start_ea
+        if start in node_index:
+            seeds.append({
+                "sancov_index": sancov_index,
+                "pc": hex(pc),
+                "bb_start": hex(start),
+                "node_index": node_index[start],
+            })
+        else:
+            seeds.append({
+                "sancov_index": sancov_index,
+                "pc": hex(pc),
+                "bb_start": hex(start),
+                "node_index": None,
+                "note": "non_target",
+            })
+    return seeds
+
+
+def validate_unique_sancov_seed_nodes(seeds):
+    """Fail fast if two sancov sites map to the same ACFG node.
+
+    Plan decision 12: duplicate sancov seeds are an instrumentation
+    error and must not be silently merged.
+    """
+    by_node = {}
+    for seed in seeds:
+        node = seed.get("node_index")
+        if node is None:
+            continue
+        by_node.setdefault(node, []).append(seed)
+
+    duplicates = {node: ss for node, ss in by_node.items() if len(ss) > 1}
+    if not duplicates:
+        return
+
+    lines = [
+        "BOFuzz ACFG Voronoi error: duplicate sancov seeds map to the same ACFG block.",
+    ]
+    for node, ss in sorted(duplicates.items()):
+        bb_start = ss[0].get("bb_start")
+        lines.append(f"  node_index={node} bb_start={bb_start}")
+        for seed in ss:
+            lines.append(
+                "    sancov_index={} pc={} bb_start={}".format(
+                    seed["sancov_index"], seed.get("pc"), seed.get("bb_start"),
+                )
+            )
+    lines.append(
+        "This indicates invalid or ambiguous instrumentation. "
+        "Please debug sancov PC mapping."
+    )
+    raise RuntimeError("\n".join(lines))
+
+
+def build_acfg_voronoi_regions(node_count, seeds, voronoi_adj):
+    """Multi-source directed-successor Voronoi partition.
+
+    Tie-break: smaller sancov_index claims the node. Done by processing
+    BFS layer-by-layer and taking the minimum candidate owner per node
+    within a layer. Each node is finalized at the first distance it is
+    reached, so layer ordering yields deterministic regions.
+
+    Returns ``(regions_by_sancov_index, node_assignment, unassigned)``.
+    """
+    owner = [None] * node_count
+    distance = [None] * node_count
+
+    seed_pairs = []
+    for seed in seeds:
+        n = seed.get("node_index")
+        if n is None:
+            continue
+        if not (0 <= n < node_count):
+            continue
+        seed_pairs.append((seed["sancov_index"], n))
+
+    # Initialize layer 0 in ascending sancov_index order so the smallest
+    # index claims any shared node first. Duplicates should already have
+    # been rejected by ``validate_unique_sancov_seed_nodes``.
+    current_layer = []
+    for si, n in sorted(seed_pairs, key=lambda x: x[0]):
+        if owner[n] is None:
+            owner[n] = si
+            distance[n] = 0
+            current_layer.append(n)
+
+    d = 0
+    while current_layer:
+        next_layer_owner = {}
+        for u in current_layer:
+            ou = owner[u]
+            for v in voronoi_adj.get(u, ()):
+                if owner[v] is not None:
+                    continue
+                existing = next_layer_owner.get(v)
+                if existing is None or ou < existing:
+                    next_layer_owner[v] = ou
+
+        new_layer = []
+        for v, ow in next_layer_owner.items():
+            owner[v] = ow
+            distance[v] = d + 1
+            new_layer.append(v)
+
+        current_layer = new_layer
+        d += 1
+
+    regions_by_sancov = defaultdict(list)
+    node_assignment = {}
+    unassigned = []
+    for n in range(node_count):
+        if owner[n] is None:
+            unassigned.append(n)
+        else:
+            regions_by_sancov[owner[n]].append(n)
+            node_assignment[n] = {"owner": owner[n], "distance": distance[n]}
+
+    return dict(regions_by_sancov), node_assignment, unassigned
+
+
+def aggregate_voronoi_region(values_by_node, region_nodes, node_assignment, gamma):
+    """Weighted-mean aggregation over one Voronoi region.
+
+    ``agg = sum_v gamma^dist(s,v) * x_v  /  sum_v gamma^dist(s,v)``
+
+    Falls back to 0 on empty or degenerate weight sums (the seed itself
+    is always at distance 0 with weight 1 if it is in the region).
+    """
+    if not region_nodes:
+        return 0.0
+    num = 0.0
+    den = 0.0
+    for node_idx in region_nodes:
+        info = node_assignment.get(node_idx)
+        if info is None:
+            continue
+        w = gamma ** info["distance"]
+        v = finite_or_zero(values_by_node.get(node_idx, 0.0))
+        num += w * v
+        den += w
+    if den <= 0.0:
+        return 0.0
+    return finite_or_zero(num / den)
+
+
+def build_voronoi_runtime_feature_arrays(blocks, node_order, schema_features,
+                                          seeds, regions_by_sancov,
+                                          node_assignment, gamma,
+                                          signal_source="norm"):
+    """Per-feature, sancov-aligned arrays produced by Voronoi aggregation.
+
+    Output shape: ``{feature_name: [v0, v1, ..., v_{S-1}]}`` where S is
+    ``len(seeds)`` (i.e. ``len(sancov_sites)``). Unmapped sancov sites
+    or unmapped regions emit ``0.0``.
+    """
+    n_sancov = len(seeds)
+    feature_arrays = {}
+
+    seed_by_index = [None] * n_sancov
+    for seed in seeds:
+        si = seed["sancov_index"]
+        if 0 <= si < n_sancov:
+            seed_by_index[si] = seed
+
+    for spec in schema_features:
+        feature_name = spec["name"]
+        # Build per-node value map once per feature.
+        values_by_node = {}
+        for node_idx, ea in enumerate(node_order):
+            block = blocks[ea]
+            if signal_source == "raw":
+                val = block.raw_attrs.get(feature_name, 0.0)
+            else:
+                val = block.norm_attrs.get(feature_name, 0.0)
+            values_by_node[node_idx] = finite_or_zero(val)
+
+        arr = []
+        for sancov_index in range(n_sancov):
+            seed = seed_by_index[sancov_index]
+            if seed is None or seed.get("node_index") is None:
+                arr.append(0.0)
+                continue
+            region = regions_by_sancov.get(sancov_index, [])
+            if not region:
+                # Empty region: fall back to direct seed-node value.
+                arr.append(finite_or_zero(values_by_node.get(seed["node_index"], 0.0)))
+                continue
+            arr.append(aggregate_voronoi_region(
+                values_by_node, region, node_assignment, gamma,
+            ))
+        feature_arrays[feature_name] = arr
+
+    return feature_arrays
+
+
+# ======================= ACFG / STATISTICS / VORONOI EXPORTERS =======================
+def save_acfg_json(out_dir, base, target_name, blocks, node_order,
+                    node_index, adj_directed, signal_source, edge_mode,
+                    voronoi_distance, eps):
+    """Emit ``<base>_acfg.json`` (schema v3)."""
+    nodes = []
+    for ea in node_order:
+        b = blocks[ea]
+        nodes.append({
+            "index": node_index[ea],
+            "bb_start": hex(ea),
+            "func": hex(b.func_ea),
+            "attrs_raw": {k: finite_or_zero(v) for k, v in b.raw_attrs.items()},
+            "attrs_norm": {k: finite_or_zero(v) for k, v in b.norm_attrs.items()},
+        })
+    edges = []
+    for i in sorted(adj_directed.keys()):
+        for k in adj_directed[i]:
+            edges.append([i, k])
+
+    payload = {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "kind": "bofuzz-acfg-v1",
+        "target": target_name,
+        "signal_source": signal_source,
+        "moran_edge_mode": edge_mode,
+        "voronoi_distance": voronoi_distance,
+        "eps": eps,
+        "n_nodes": len(nodes),
+        "n_edges": len(edges),
+        "nodes": nodes,
+        "edges": edges,
+    }
+    out_path = os.path.join(out_dir, f"{base}_acfg.json")
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    if VERBOSE:
+        print(f"[+] Saved ACFG -> {out_path}")
+    return out_path
+
+
+def save_acfg_voronoi_json(out_dir, base, target_name, seeds,
+                            regions_by_sancov, node_assignment,
+                            unassigned_nodes, n_nodes, gamma,
+                            distance_mode, aggregation_mode):
+    """Emit ``<base>_acfg_voronoi.json`` (schema v3)."""
+    regions = []
+    n_valid_seeds = 0
+    n_unmapped = 0
+    assigned_nodes = 0
+    for seed in seeds:
+        node = seed.get("node_index")
+        if node is None:
+            n_unmapped += 1
+            continue
+        n_valid_seeds += 1
+        si = seed["sancov_index"]
+        region = regions_by_sancov.get(si, [])
+        assigned_nodes += len(region)
+        if region:
+            distances = [node_assignment[n]["distance"] for n in region]
+            max_d = max(distances)
+            mean_d = sum(distances) / float(len(distances))
+        else:
+            max_d = 0
+            mean_d = 0.0
+        regions.append({
+            "sancov_index": si,
+            "pc": seed.get("pc"),
+            "seed_node": node,
+            "region_size": len(region),
+            "max_distance": max_d,
+            "mean_distance": finite_or_zero(mean_d),
+            "nodes": region,
+        })
+
+    unassigned_ratio = (len(unassigned_nodes) / float(n_nodes)) if n_nodes > 0 else 0.0
+    payload = {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "kind": "bofuzz-acfg-voronoi-v1",
+        "target": target_name,
+        "distance_mode": distance_mode,
+        "aggregation_mode": aggregation_mode,
+        "gamma": gamma,
+        "n_acfg_nodes": n_nodes,
+        "n_sancov_sites": len(seeds),
+        "valid_seed_nodes": n_valid_seeds,
+        "unmapped_sancov_sites": n_unmapped,
+        "assigned_nodes": assigned_nodes,
+        "unassigned_nodes": len(unassigned_nodes),
+        "unassigned_node_ratio": finite_or_zero(unassigned_ratio),
+        "regions": regions,
+    }
+    out_path = os.path.join(out_dir, f"{base}_acfg_voronoi.json")
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    if VERBOSE:
+        print(f"[+] Saved ACFG Voronoi -> {out_path}")
+    return out_path
+
+
+def save_acfg_statistics_json(out_dir, base, target_name, schema_features,
+                                ranked_stats, n_nodes, n_edges,
+                                signal_source, edge_mode, eps,
+                                runtime_map_meta):
+    """Emit ``<base>_statistics.json`` and ``top4 / top6`` masks.
+
+    Returns ``(stats_path, top4_path, top6_path, top4, top6)``.
+    """
+    # ``ranked_stats`` is the ranked view; copy back the rank into schema
+    # order for the ``features`` listing.
+    features_in_schema_order = []
+    rank_by_id = {row["feature_id"]: row for row in ranked_stats}
+    for spec in schema_features:
+        row = rank_by_id.get(spec["id"])
+        if row is None:
+            continue
+        features_in_schema_order.append(row)
+
+    top4 = ranked_stats[:4]
+    top6 = ranked_stats[:6]
+    top4_ids = [row["feature_id"] for row in top4]
+    top6_ids = [row["feature_id"] for row in top6]
+    top4_mask = vec_mask_from_feature_ids(schema_features, top4_ids)
+    top6_mask = vec_mask_from_feature_ids(schema_features, top6_ids)
+
+    payload = {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "kind": "bofuzz-acfg-statistics-v1",
+        "target": target_name,
+        "signal_source": signal_source,
+        "moran_edge_mode": edge_mode,
+        "eps": eps,
+        "ranking_metric": "abs_acfg_rds",
+        "n_blocks": n_nodes,
+        "n_edges": n_edges,
+        "features": features_in_schema_order,
+        "top4": {
+            "selection_rule": "largest abs(acfg_rds)",
+            "vec_mask": top4_mask,
+            "features": top4_ids,
+        },
+        "top6": {
+            "selection_rule": "largest abs(acfg_rds)",
+            "vec_mask": top6_mask,
+            "features": top6_ids,
+        },
+        "runtime_map_aggregation": runtime_map_meta,
+    }
+    stats_path = os.path.join(out_dir, f"{base}_statistics.json")
+    with open(stats_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    if VERBOSE:
+        print(f"[+] Saved ACFG statistics -> {stats_path}")
+
+    top4_path = os.path.join(out_dir, f"{base}_acfg_rds_top4_vec_mask.txt")
+    with open(top4_path, "w") as f:
+        f.write(top4_mask + "\n")
+    top6_path = os.path.join(out_dir, f"{base}_acfg_rds_top6_vec_mask.txt")
+    with open(top6_path, "w") as f:
+        f.write(top6_mask + "\n")
+    if VERBOSE:
+        print(f"[+] Saved top4 vec mask -> {top4_path}")
+        print(f"[+] Saved top6 vec mask -> {top6_path}")
+
+    return stats_path, top4_path, top6_path, top4, top6
+
+
+class _MockBlock(object):
+    """Minimal BBlock stand-in for ``--self-test-acfg-stats``."""
+    __slots__ = ("func_ea", "addr", "raw_attrs", "norm_attrs", "debug")
+
+    def __init__(self, addr, raw=None, norm=None):
+        self.func_ea = 0
+        self.addr = addr
+        self.raw_attrs = dict(raw or {})
+        self.norm_attrs = dict(norm or {})
+        self.debug = {}
+
+
+def _approx(a, b, tol=1e-9):
+    return abs(float(a) - float(b)) <= tol
+
+
+def run_acfg_self_tests():
+    """Pure-Python self-tests for ACFG statistics and Voronoi aggregation.
+
+    Implements every case in plan section 17. Returns 0 on success, raises
+    AssertionError otherwise. Imports nothing from IDA so it runs from a
+    plain ``python3`` invocation.
+    """
+    failures = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            print(f"  PASS  {name}")
+        else:
+            print(f"  FAIL  {name}: {detail}")
+            failures.append(name)
+
+    print("[self-test] uniform values")
+    z_uniform = [1.0, 1.0, 1.0, 1.0]
+    g_uniform = gini_coefficient(z_uniform)
+    check("gini(uniform) == 0", _approx(g_uniform, 0.0), f"got {g_uniform}")
+
+    print("[self-test] concentrated values")
+    z_concentrated = [0.0, 0.0, 0.0, 10.0]
+    g_conc = gini_coefficient(z_concentrated)
+    check("gini(concentrated) > 0", g_conc > 0.0, f"got {g_conc}")
+    # Closed-form: 2*(4*10)/(4*10) - (4+1)/4 = 2 - 1.25 = 0.75
+    check("gini(concentrated) == 0.75", _approx(g_conc, 0.75), f"got {g_conc}")
+
+    print("[self-test] all-zero strength")
+    g_zero = gini_coefficient([0.0, 0.0, 0.0])
+    mi_zero = moran_i([0.0, 0.0, 0.0], {0: [1], 1: [2]})
+    check("gini(zero) == 0", _approx(g_zero, 0.0), f"got {g_zero}")
+    check("moran(constant) == 0", _approx(mi_zero, 0.0), f"got {mi_zero}")
+
+    print("[self-test] directed clustered chain 0->1->2->3 with z=[0,0,10,10]")
+    chain_adj = {0: [1], 1: [2], 2: [3]}
+    z = [0.0, 0.0, 10.0, 10.0]
+    r = average_ranks(z)
+    mi_clust = moran_i(r, chain_adj)
+    check("MoranI(rank(z)) > 0 for clustered chain", mi_clust > 0.0,
+          f"got {mi_clust}")
+
+    print("[self-test] directed alternating chain 0->1->2->3 with z=[0,10,0,10]")
+    z_alt = [0.0, 10.0, 0.0, 10.0]
+    r_alt = average_ranks(z_alt)
+    mi_alt = moran_i(r_alt, chain_adj)
+    check("MoranI(rank(z)) < 0 for alternating chain", mi_alt < 0.0,
+          f"got {mi_alt}")
+
+    print("[self-test] non-finite inputs collapse to zero")
+    bad_signal = [float("nan"), float("inf"), -float("inf"), "abc", None, 3.0]
+    z_bad = to_strength_signal(bad_signal, eps=1e-8)
+    check("to_strength_signal sanitizes NaN/inf/strings/None",
+          z_bad == [0.0, 0.0, 0.0, 0.0, 0.0, 3.0],
+          f"got {z_bad}")
+
+    print("[self-test] rank ties use average rank")
+    r_ties = average_ranks([10.0, 10.0, 20.0, 5.0])
+    # Sorted: [5,10,10,20] => positions 1,2,3,4. Two 10's tie -> rank=2.5.
+    # 5->1, 10->2.5, 10->2.5, 20->4
+    check("average ranks correct for ties",
+          [_approx(a, b) for a, b in zip(r_ties, [2.5, 2.5, 4.0, 1.0])] == [True]*4,
+          f"got {r_ties}")
+
+    print("[self-test] directed-successor Voronoi partition: 0->1->2->3->4 seeds {0,3}")
+    cfg = {
+        0x1000: {0x1010},
+        0x1010: {0x1020},
+        0x1020: {0x1030},
+        0x1030: {0x1040},
+        0x1040: set(),
+    }
+    blocks_fake = {ea: _MockBlock(ea) for ea in cfg}
+    node_order_fake, node_index_fake = build_acfg_index(blocks_fake)
+    expected_order = [0x1000, 0x1010, 0x1020, 0x1030, 0x1040]
+    check("ACFG node order sorted by address",
+          node_order_fake == expected_order,
+          f"got {node_order_fake}")
+    vor_adj = build_voronoi_adjacency(cfg, node_index_fake)
+    seeds_fake = [
+        {"sancov_index": 0, "pc": "0x1000",
+         "bb_start": "0x1000", "node_index": node_index_fake[0x1000]},
+        {"sancov_index": 1, "pc": "0x1030",
+         "bb_start": "0x1030", "node_index": node_index_fake[0x1030]},
+    ]
+    regions, assign, unassigned = build_acfg_voronoi_regions(
+        len(node_order_fake), seeds_fake, vor_adj,
+    )
+    # seed 0 owns nodes 0,1,2 ; seed 1 owns nodes 3,4 ; nothing unassigned.
+    check("Voronoi region(seed=0) == [0,1,2]",
+          regions.get(0) == [0, 1, 2], f"got {regions.get(0)}")
+    check("Voronoi region(seed=1) == [3,4]",
+          regions.get(1) == [3, 4], f"got {regions.get(1)}")
+    check("no unassigned nodes in fully-reachable chain",
+          unassigned == [], f"got {unassigned}")
+    check("distance(seed=0, node=2) == 2",
+          assign[2]["distance"] == 2,
+          f"got {assign[2]['distance']}")
+    check("distance(seed=1, node=4) == 1",
+          assign[4]["distance"] == 1,
+          f"got {assign[4]['distance']}")
+
+    print("[self-test] directed-successor unassigned (0->1 and 2->3 with seed=0)")
+    cfg2 = {0x2000: {0x2010}, 0x2010: set(), 0x2020: {0x2030}, 0x2030: set()}
+    blocks_fake2 = {ea: _MockBlock(ea) for ea in cfg2}
+    node_order_2, node_index_2 = build_acfg_index(blocks_fake2)
+    vor_adj_2 = build_voronoi_adjacency(cfg2, node_index_2)
+    seeds_2 = [
+        {"sancov_index": 0, "pc": "0x2000",
+         "bb_start": "0x2000", "node_index": node_index_2[0x2000]},
+    ]
+    regions2, assign2, unassigned2 = build_acfg_voronoi_regions(
+        len(node_order_2), seeds_2, vor_adj_2,
+    )
+    check("seed=0 owns {0,1}",
+          regions2.get(0) == [node_index_2[0x2000], node_index_2[0x2010]],
+          f"got {regions2.get(0)}")
+    check("nodes 2,3 unassigned (no incoming edge from seed)",
+          sorted(unassigned2)
+          == sorted([node_index_2[0x2020], node_index_2[0x2030]]),
+          f"got {sorted(unassigned2)}")
+
+    print("[self-test] Voronoi tie-break uses smaller sancov index")
+    # 0 and 1 both reach node 2 at distance 1: 0->2 and 1->2.
+    cfg_tie = {0xA: {0xC}, 0xB: {0xC}, 0xC: set()}
+    blocks_tie = {ea: _MockBlock(ea) for ea in cfg_tie}
+    n_order_t, n_idx_t = build_acfg_index(blocks_tie)
+    vor_t = build_voronoi_adjacency(cfg_tie, n_idx_t)
+    # Reverse sancov order on purpose: smaller index should still win.
+    seeds_tie = [
+        {"sancov_index": 7, "pc": "0xB",
+         "bb_start": "0xB", "node_index": n_idx_t[0xB]},
+        {"sancov_index": 3, "pc": "0xA",
+         "bb_start": "0xA", "node_index": n_idx_t[0xA]},
+    ]
+    regions_t, assign_t, _u = build_acfg_voronoi_regions(
+        len(n_order_t), seeds_tie, vor_t,
+    )
+    check("tie-break -> sancov 3 (smaller) owns node 0xC",
+          assign_t[n_idx_t[0xC]]["owner"] == 3,
+          f"got owner {assign_t[n_idx_t[0xC]]['owner']}")
+
+    print("[self-test] duplicate sancov seed nodes are fatal")
+    seeds_dup = [
+        {"sancov_index": 17, "pc": "0x401232",
+         "bb_start": "0x401230", "node_index": 0},
+        {"sancov_index": 18, "pc": "0x401235",
+         "bb_start": "0x401230", "node_index": 0},
+    ]
+    raised = False
+    try:
+        validate_unique_sancov_seed_nodes(seeds_dup)
+    except RuntimeError as e:
+        raised = True
+        msg = str(e)
+        check("duplicate error mentions both sancov_index",
+              "sancov_index=17" in msg and "sancov_index=18" in msg,
+              f"got message: {msg}")
+        check("duplicate error mentions both pcs",
+              "0x401232" in msg and "0x401235" in msg,
+              f"got message: {msg}")
+    check("duplicate seed mapping raises RuntimeError", raised,
+          "no exception raised")
+
+    print("[self-test] Voronoi weighted aggregation gamma=0.5")
+    # seed=0, region={0:dist 0, 1:dist 1}, values={0:10, 1:20}
+    # expected: (1.0*10 + 0.5*20)/(1.0+0.5) = 20/1.5 = 13.333...
+    values_by_node = {0: 10.0, 1: 20.0}
+    region_nodes = [0, 1]
+    node_assign_test = {
+        0: {"owner": 0, "distance": 0},
+        1: {"owner": 0, "distance": 1},
+    }
+    agg = aggregate_voronoi_region(
+        values_by_node, region_nodes, node_assign_test, gamma=0.5,
+    )
+    check("aggregate_voronoi_region matches closed-form 13.333...",
+          _approx(agg, 20.0 / 1.5, tol=1e-9), f"got {agg}")
+
+    print("[self-test] empty region falls back to zero")
+    agg_empty = aggregate_voronoi_region({}, [], {}, gamma=0.5)
+    check("empty region aggregation -> 0.0", _approx(agg_empty, 0.0),
+          f"got {agg_empty}")
+
+    print("[self-test] full feature statistics pipeline")
+    # Reuse the 4-node chain with a synthetic feature that clusters strongly.
+    blocks_pipe = {}
+    eas = expected_order  # [0x1000, 0x1010, 0x1020, 0x1030, 0x1040]
+    feat_values = [0.0, 0.0, 10.0, 10.0, 10.0]
+    for ea, v in zip(eas, feat_values):
+        blocks_pipe[ea] = _MockBlock(ea, norm={"test_feature": v})
+    node_order_p, node_index_p = build_acfg_index(blocks_pipe)
+    adj_p = build_acfg_adjacency(cfg, node_index_p, edge_mode="directed")
+    schema = [{"id": "T00", "name": "test_feature", "group": "instruction"}]
+    stats, ranked = compute_acfg_feature_statistics(
+        blocks_pipe, schema, node_order_p, adj_p,
+        signal_source="norm", eps=1e-8, edge_mode="directed",
+    )
+    check("stats list non-empty", len(stats) == 1, f"got {len(stats)}")
+    check("ranked entry has rank_by_abs_acfg_rds",
+          ranked[0].get("rank_by_abs_acfg_rds") == 1,
+          f"got {ranked[0]}")
+    check("clustered signal -> abs_acfg_rds > 0",
+          ranked[0]["abs_acfg_rds"] > 0.0,
+          f"got {ranked[0]['abs_acfg_rds']}")
+
+    print("[self-test] vec_mask_from_feature_ids")
+    schema16 = _build_runtime_schema()["features"]
+    mask = vec_mask_from_feature_ids(schema16, ["I00", "I07", "S04", "S07"])
+    check("vec_mask length == 16", len(mask) == 16, f"got len={len(mask)}")
+    check("vec_mask has exactly four set bits", mask.count("1") == 4,
+          f"got {mask} ones={mask.count('1')}")
+
+    print("[self-test] directed mode covers Decision 2 weight convention")
+    # Plan Decision 2: for CFG edge u->v, directed mode sets w_uv=1, w_vu=0.
+    # Build adj from CFG edge 0->1 with edge_mode=directed/undirected and
+    # confirm S0_directed==1, S0_undirected==2 (Moran's I itself is
+    # invariant to symmetrization on simple CFGs; that is a property of
+    # the formula, not a bug).
+    cfg_one_edge = {0x100: {0x110}, 0x110: set()}
+    blocks_oe = {ea: _MockBlock(ea) for ea in cfg_one_edge}
+    _, ni_oe = build_acfg_index(blocks_oe)
+    adj_dir = build_acfg_adjacency(cfg_one_edge, ni_oe, edge_mode="directed")
+    adj_und = build_acfg_adjacency(cfg_one_edge, ni_oe, edge_mode="undirected")
+    s0_dir = sum(len(v) for v in adj_dir.values())
+    s0_und = sum(len(v) for v in adj_und.values())
+    check("directed mode has S0=1 (single CFG edge)", s0_dir == 1,
+          f"got {s0_dir}")
+    check("undirected mode has S0=2 (symmetrized)", s0_und == 2,
+          f"got {s0_und}")
+
+    print("[self-test] Voronoi adjacency stays directed-only")
+    # CFG edge u->v must produce u_idx -> v_idx only in Voronoi adjacency,
+    # never the reverse (Decision 3).
+    vor_oe = build_voronoi_adjacency(cfg_one_edge, ni_oe)
+    src_idx = ni_oe[0x100]
+    dst_idx = ni_oe[0x110]
+    check("voronoi_adj[u] contains v",
+          dst_idx in vor_oe.get(src_idx, []),
+          f"got {vor_oe}")
+    check("voronoi_adj[v] does NOT contain u",
+          src_idx not in vor_oe.get(dst_idx, []),
+          f"got {vor_oe}")
+
+    if failures:
+        print(f"\n[self-test] FAILED ({len(failures)} failures)")
+        for f in failures:
+            print(f"    - {f}")
+        raise AssertionError(
+            f"{len(failures)} ACFG self-test(s) failed: {failures}"
+        )
+    print("\n[self-test] ALL CHECKS PASSED")
+    return 0
+
+
+def save_acfg_feature_ranking_debug(out_dir, base, ranked_stats):
+    """Optional human-readable per-feature ranking dump."""
+    out_path = os.path.join(out_dir, f"{base}_acfg_feature_ranking.txt")
+    with open(out_path, "w") as f:
+        f.write(
+            "{:<5s} {:<28s} {:<11s} {:>14s} {:>14s} {:>14s} {:>14s} {:>5s} {:>8s}\n".format(
+                "rank", "feature_name", "feature_id",
+                "moran_i", "gini", "acfg_rds", "abs_rds",
+                "act", "sign",
+            )
+        )
+        f.write("-" * 124 + "\n")
+        for row in ranked_stats:
+            f.write(
+                "{:<5d} {:<28s} {:<11s} {:>14.6f} {:>14.6f} {:>14.6f} {:>14.6f} {:>5d} {:>8s}\n".format(
+                    row["rank_by_abs_acfg_rds"],
+                    row["feature_name"],
+                    row["feature_id"],
+                    row["moran_i_rank_strength"],
+                    row["gini_strength"],
+                    row["acfg_rds"],
+                    row["abs_acfg_rds"],
+                    row["active_count"],
+                    row["sign"],
+                )
+            )
+    if VERBOSE:
+        print(f"[+] Saved ACFG feature ranking debug -> {out_path}")
+    return out_path
+
+
 # ======================= WEIGHT / FEATURES MAP =======================
 def l2_norm(vec):
     return math.sqrt(sum(float(x) * float(x) for x in vec))
@@ -1543,121 +2472,14 @@ def _cross_platform_basename(path):
     return os.path.basename(path.replace("\\", "/"))
 
 
-def build_and_save_features_map(pcs, CFG, blocks, func_of_bb, reachable_edges=None,
-                                 out_dir_override=None, base_override=None):
-    bin_path = ida_nalt.get_input_file_path()
-    base = base_override or _cross_platform_basename(bin_path)
-    out_dir = out_dir_override or os.path.dirname(bin_path) or os.getcwd()
-
-    bb_cache = BBCache()
-
-    fmap = []
-    dbg = []
-    target_bb_set = set(blocks.keys())
-
-    for idx, pc in enumerate(pcs):
-        bb = bb_cache.find_block(pc)
-        if not bb:
-            fmap.append(EPS_NON_TARGET)
-            dbg.append({
-                "index": idx,
-                "pc": hex(pc),
-                "bb_start": None,
-                "func": None,
-                "attrs_raw": None,
-                "attrs_norm": None,
-                "debug": None,
-                "weight": float(EPS_NON_TARGET),
-                "note": "no_bb"
-            })
-            continue
-
-        start = bb.start_ea
-        if start in target_bb_set:
-            b = blocks[start]
-            w = directional_weight(b.to_attr_list_norm())
-            fmap.append(float(w))
-            dbg.append({
-                "index": idx,
-                "pc": hex(pc),
-                "bb_start": hex(start),
-                "func": hex(b.func_ea),
-                "attrs_raw": dict(b.raw_attrs),
-                "attrs_norm": dict(b.norm_attrs),
-                "debug": dict(getattr(b, "debug", {})),
-                "weight": float(w),
-            })
-        else:
-            fmap.append(EPS_NON_TARGET)
-            dbg.append({
-                "index": idx,
-                "pc": hex(pc),
-                "bb_start": hex(start),
-                "func": None,
-                "attrs_raw": None,
-                "attrs_norm": None,
-                "debug": None,
-                "weight": float(EPS_NON_TARGET),
-                "note": "non_target"
-            })
-
-    out_path = os.path.join(out_dir, f"{base}_features_map_default.json")
-    with open(out_path, "w") as f:
-        json.dump(fmap, f, indent=2)
-    if VERBOSE:
-        print(f"[+] Saved features_map_default -> {out_path}")
-
-    dbg_path = os.path.join(out_dir, f"{base}_features_map.debug.json")
-    dbg_payload = {
-        "schema_version": FEATURE_SCHEMA_VERSION,
-        "attr_names": ATTR_NAMES,
-        "normalization": {
-            "default": "zscore(raw)",
-            "log1p_features": sorted(LOG1P_FEATURES),
-            "raw_binary_features": sorted(RAW_BINARY_FEATURES),
-        },
-        "apagerank_enabled": USE_APAGERANK,
-        "reachable_edges": reachable_edges,
-        "pcs": [hex(p) for p in pcs],
-        "map": dbg,
-    }
-    with open(dbg_path, "w") as f:
-        json.dump(dbg_payload, f, indent=2)
-    if VERBOSE:
-        print(f"[+] Saved debug map   -> {dbg_path}")
-
-    return out_path, dbg_path
-
-def build_and_save_features_map_for_u(pcs, blocks, func_of_bb, u, out_filename,
-                                       out_dir_override=None):
-    bin_path = ida_nalt.get_input_file_path()
-    out_dir = out_dir_override or os.path.dirname(bin_path) or os.getcwd()
-
-    bb_cache = BBCache()
-    target_bb_set = set(blocks.keys())
-
-    fmap = []
-    for idx, pc in enumerate(pcs):
-        bb = bb_cache.find_block(pc)
-        if not bb:
-            fmap.append(float(EPS_NON_TARGET))
-            continue
-
-        start = bb.start_ea
-        if start in target_bb_set:
-            b = blocks[start]
-            zn = b.to_attr_list_norm()
-            w = directional_weight(zn, u=u)
-            fmap.append(float(w))
-        else:
-            fmap.append(float(EPS_NON_TARGET))
-
-    out_path = os.path.join(out_dir, out_filename)
-    with open(out_path, "w") as f:
-        json.dump(fmap, f, indent=2)
-    if VERBOSE:
-        print(f"[+] Saved features_map (u provided) -> {out_path}")
-    return fmap, out_path
+# NOTE: the historical per-PC ``build_and_save_features_map`` and
+# ``build_and_save_features_map_for_u`` helpers used a per-block direct lookup
+# (with ``EPS_NON_TARGET`` for non-target PCs). They have been replaced by the
+# ACFG Voronoi region aggregation pipeline (plan Decision 9). The current
+# default map and debug JSON are emitted inline from ``run_extraction`` using
+# ``build_voronoi_runtime_feature_arrays`` so that every sancov site reflects
+# the directed-successor Voronoi region it represents, not just its seed
+# block.
 
 def _build_runtime_schema():
     """Build the canonical runtime features_schema.json content (schema v3)."""
@@ -1783,6 +2605,65 @@ def parse_cli_args(argv):
         action="store_true",
         help="Enable verbose logging.",
     )
+
+    # ---- ACFG statistics flags (Decision 8 / 4 / 5 / 2) ----
+    parser.add_argument(
+        "--no-acfg-stats",
+        action="store_true",
+        help="Disable ACFG-RDS statistics export.",
+    )
+    parser.add_argument(
+        "--acfg-stats-eps",
+        type=float,
+        default=1e-8,
+        help="Near-zero threshold for ACFG-RDS feature strength.",
+    )
+    parser.add_argument(
+        "--acfg-stats-signal",
+        choices=["norm", "raw"],
+        default="norm",
+        help="Feature signal source for ACFG statistics. Default: norm.",
+    )
+    parser.add_argument(
+        "--acfg-edge-mode",
+        choices=["directed", "undirected"],
+        default="directed",
+        help="CFG adjacency mode for Moran's I. Default: directed.",
+    )
+
+    # ---- Sancov-site Voronoi aggregation flags (Decision 9 / 3 / 10) ----
+    parser.add_argument(
+        "--sancov-agg-mode",
+        choices=["none", "voronoi-weighted-mean"],
+        default="voronoi-weighted-mean",
+        help="Aggregation mode for sancov-aligned runtime feature maps.",
+    )
+    parser.add_argument(
+        "--sancov-voronoi-distance",
+        choices=["directed-successor"],
+        default="directed-successor",
+        help=(
+            "Graph distance mode for assigning ACFG blocks to sancov Voronoi "
+            "regions. Default: directed-successor."
+        ),
+    )
+    parser.add_argument(
+        "--sancov-voronoi-gamma",
+        type=float,
+        default=0.5,
+        help="Distance decay factor for Voronoi weighted aggregation.",
+    )
+
+    # ---- Pure-Python self-test (Plan section 17) ----
+    parser.add_argument(
+        "--self-test-acfg-stats",
+        action="store_true",
+        help=(
+            "Run pure-Python ACFG statistics and Voronoi aggregation "
+            "self-tests and exit."
+        ),
+    )
+
     return parser.parse_args(argv)
 
 
@@ -2007,36 +2888,230 @@ def run_extraction(args):
     out_dir_override = get_output_dir(args)
     out_dir = out_dir_override
 
-    attr_arrays = {}
-    dim = len(ATTR_NAMES)
-    for i, name in enumerate(ATTR_NAMES):
-        u_one_hot = [0.0] * dim
-        u_one_hot[i] = 1.0
-        out_file = f"{base}_features_map_{name}.json"
-        fmap, _ = build_and_save_features_map_for_u(
-            pcs, blocks, func_of_bb, u_one_hot, out_file,
-            out_dir_override=out_dir_override,
-        )
-        attr_arrays[name] = fmap
+    # =====================================================================
+    # ACFG construction + Voronoi partition over directed-successor edges
+    # =====================================================================
+    print("[+] Building ACFG (full target-only) ...")
+    node_order, node_index = build_acfg_index(blocks)
+    n_nodes = len(node_order)
+    acfg_adj = build_acfg_adjacency(CFG, node_index, args.acfg_edge_mode)
+    n_edges = sum(len(vs) for vs in acfg_adj.values())
+    voronoi_adj = build_voronoi_adjacency(CFG, node_index)
+    print(f"    ACFG nodes={n_nodes} edges_{args.acfg_edge_mode}={n_edges}")
 
+    print("[+] Mapping sancov sites to ACFG seed nodes ...")
+    bb_cache = BBCache()
+    sancov_seeds = build_sancov_seed_nodes(pcs, bb_cache, blocks, node_index)
+    # Fail fast if any two sancov sites map to the same ACFG block.
+    validate_unique_sancov_seed_nodes(sancov_seeds)
+
+    print(
+        f"[+] Building ACFG Voronoi regions "
+        f"(distance={args.sancov_voronoi_distance}, gamma={args.sancov_voronoi_gamma}) ..."
+    )
+    regions_by_sancov, node_assignment, unassigned_nodes = build_acfg_voronoi_regions(
+        n_nodes, sancov_seeds, voronoi_adj,
+    )
+    valid_seed_count = sum(
+        1 for s in sancov_seeds if s.get("node_index") is not None
+    )
+    unmapped_seed_count = len(sancov_seeds) - valid_seed_count
+    assigned_count = n_nodes - len(unassigned_nodes)
+    print(
+        f"    seeds total={len(sancov_seeds)} valid={valid_seed_count} "
+        f"unmapped={unmapped_seed_count}; "
+        f"assigned_nodes={assigned_count} unassigned_nodes={len(unassigned_nodes)}"
+    )
+
+    # =====================================================================
+    # Voronoi-aggregated runtime feature arrays (sancov-aligned)
+    # =====================================================================
+    schema_features = _build_runtime_schema()["features"]
+    if args.sancov_agg_mode == "voronoi-weighted-mean":
+        print("[+] Aggregating runtime features via Voronoi weighted mean ...")
+        feature_arrays_by_name = build_voronoi_runtime_feature_arrays(
+            blocks, node_order, schema_features, sancov_seeds,
+            regions_by_sancov, node_assignment, args.sancov_voronoi_gamma,
+            signal_source="norm",
+        )
+    else:
+        # ``none`` mode keeps the legacy "direct seed value" semantics: each
+        # sancov site emits its seed block's normalized feature value (or 0
+        # when the PC is not in a target block). Kept for ablation only.
+        print("[+] Sancov aggregation disabled (--sancov-agg-mode none) ...")
+        feature_arrays_by_name = {spec["name"]: [] for spec in schema_features}
+        for seed in sancov_seeds:
+            node_i = seed.get("node_index")
+            if node_i is None:
+                vec = [0.0] * len(schema_features)
+            else:
+                ea = node_order[node_i]
+                b = blocks[ea]
+                vec = [finite_or_zero(b.norm_attrs.get(spec["name"], 0.0))
+                       for spec in schema_features]
+            for spec, v in zip(schema_features, vec):
+                feature_arrays_by_name[spec["name"]].append(v)
+
+    # Keyed by ATTR_NAMES for backward-compat downstream consumers.
+    attr_arrays = {name: feature_arrays_by_name[name] for name in ATTR_NAMES}
     validate_exported_maps(attr_arrays, pcs)
 
+    # Save per-feature JSONs ``<base>_features_map_<name>.json``.
+    for name in ATTR_NAMES:
+        out_file = os.path.join(out_dir, f"{base}_features_map_{name}.json")
+        with open(out_file, "w") as f:
+            json.dump(attr_arrays[name], f, indent=2)
+        if VERBOSE:
+            print(f"[+] Saved features_map[{name}] -> {out_file}")
+
+    # Merged 16-key map (Voronoi-aggregated, sancov-aligned).
     merged_path = os.path.join(out_dir, f"{base}_features_map.json")
     with open(merged_path, "w") as f:
         json.dump(attr_arrays, f, indent=2)
     if VERBOSE:
         print(f"[+] Saved merged 16-key features_map -> {merged_path}")
 
-    out_map, out_dbg = build_and_save_features_map(
-        pcs, CFG, blocks, func_of_bb, reachable_edges,
-        out_dir_override=out_dir_override, base_override=base,
+    # =====================================================================
+    # Default map (directional_weight per sancov site) + debug JSON
+    # =====================================================================
+    n_sancov = len(sancov_seeds)
+    default_fmap = []
+    dbg_entries = []
+    for sancov_index in range(n_sancov):
+        seed = sancov_seeds[sancov_index]
+        vec_norm = [attr_arrays[name][sancov_index] for name in ATTR_NAMES]
+        node_i = seed.get("node_index")
+        region = regions_by_sancov.get(sancov_index, [])
+        if node_i is None:
+            weight = 0.0
+            entry = {
+                "index": sancov_index,
+                "pc": seed.get("pc"),
+                "bb_start": seed.get("bb_start"),
+                "func": None,
+                "attrs_norm_voronoi": dict(zip(ATTR_NAMES, vec_norm)),
+                "voronoi_region_size": 0,
+                "weight": weight,
+                "note": seed.get("note", "unmapped"),
+            }
+        else:
+            weight = finite_or_zero(directional_weight(vec_norm))
+            seed_ea = node_order[node_i]
+            b = blocks[seed_ea]
+            entry = {
+                "index": sancov_index,
+                "pc": seed.get("pc"),
+                "bb_start": seed.get("bb_start"),
+                "func": hex(b.func_ea),
+                "seed_node_index": node_i,
+                "attrs_raw_seed": {k: finite_or_zero(v) for k, v in b.raw_attrs.items()},
+                "attrs_norm_voronoi": dict(zip(ATTR_NAMES, vec_norm)),
+                "voronoi_region_size": len(region),
+                "weight": weight,
+            }
+        default_fmap.append(weight)
+        dbg_entries.append(entry)
+
+    default_path = os.path.join(out_dir, f"{base}_features_map_default.json")
+    with open(default_path, "w") as f:
+        json.dump(default_fmap, f, indent=2)
+    if VERBOSE:
+        print(f"[+] Saved features_map_default -> {default_path}")
+
+    dbg_path = os.path.join(out_dir, f"{base}_features_map.debug.json")
+    dbg_payload = {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "attr_names": ATTR_NAMES,
+        "normalization": {
+            "default": "zscore(raw)",
+            "log1p_features": sorted(LOG1P_FEATURES),
+            "raw_binary_features": sorted(RAW_BINARY_FEATURES),
+        },
+        "apagerank_enabled": USE_APAGERANK,
+        "reachable_edges": reachable_edges,
+        "runtime_map_aggregation": {
+            "mode": args.sancov_agg_mode,
+            "gamma": args.sancov_voronoi_gamma,
+            "distance_mode": args.sancov_voronoi_distance,
+            "valid_seed_nodes": valid_seed_count,
+            "unmapped_sancov_sites": unmapped_seed_count,
+            "assigned_nodes": assigned_count,
+            "unassigned_nodes": len(unassigned_nodes),
+        },
+        "pcs": [hex(p) for p in pcs],
+        "map": dbg_entries,
+    }
+    with open(dbg_path, "w") as f:
+        json.dump(dbg_payload, f, indent=2)
+    if VERBOSE:
+        print(f"[+] Saved debug map -> {dbg_path}")
+
+    # =====================================================================
+    # ACFG / Voronoi / Statistics exports
+    # =====================================================================
+    target_name = base
+
+    acfg_path = save_acfg_json(
+        out_dir, base, target_name, blocks, node_order, node_index,
+        acfg_adj,
+        signal_source=args.acfg_stats_signal,
+        edge_mode=args.acfg_edge_mode,
+        voronoi_distance=args.sancov_voronoi_distance,
+        eps=args.acfg_stats_eps,
     )
 
+    voronoi_path = save_acfg_voronoi_json(
+        out_dir, base, target_name, sancov_seeds, regions_by_sancov,
+        node_assignment, unassigned_nodes, n_nodes,
+        gamma=args.sancov_voronoi_gamma,
+        distance_mode=args.sancov_voronoi_distance,
+        aggregation_mode=args.sancov_agg_mode,
+    )
+
+    stats_path = top4_path = top6_path = None
+    if not args.no_acfg_stats:
+        print("[+] Computing ACFG-RDS statistics over full target ACFG ...")
+        stats_unranked, ranked_stats = compute_acfg_feature_statistics(
+            blocks, schema_features, node_order, acfg_adj,
+            signal_source=args.acfg_stats_signal,
+            eps=args.acfg_stats_eps,
+            edge_mode=args.acfg_edge_mode,
+        )
+        n_nodes_total = n_nodes
+        unassigned_ratio = (
+            len(unassigned_nodes) / float(n_nodes_total)
+            if n_nodes_total > 0 else 0.0
+        )
+        runtime_map_meta = {
+            "mode": args.sancov_agg_mode,
+            "gamma": args.sancov_voronoi_gamma,
+            "distance_mode": args.sancov_voronoi_distance,
+            "seed_count": len(sancov_seeds),
+            "valid_seed_nodes": valid_seed_count,
+            "unmapped_sancov_sites": unmapped_seed_count,
+            "assigned_nodes": assigned_count,
+            "unassigned_nodes": len(unassigned_nodes),
+            "unassigned_node_ratio": finite_or_zero(unassigned_ratio),
+        }
+        stats_path, top4_path, top6_path, _t4, _t6 = save_acfg_statistics_json(
+            out_dir, base, target_name, schema_features, ranked_stats,
+            n_nodes, n_edges,
+            signal_source=args.acfg_stats_signal,
+            edge_mode=args.acfg_edge_mode,
+            eps=args.acfg_stats_eps,
+            runtime_map_meta=runtime_map_meta,
+        )
+        if VERBOSE:
+            save_acfg_feature_ranking_debug(out_dir, base, ranked_stats)
+    else:
+        print("[+] ACFG-RDS statistics disabled (--no-acfg-stats)")
+
+    # =====================================================================
+    # Legacy schema files (unchanged)
+    # =====================================================================
     execution = _build_execution_metadata(args, bin_path, out_dir)
     execution["output_basename"] = base
     schema_path = save_schema_json(out_dir, base, execution=execution)
-
-    # Also write the canonical runtime schema to the output dir
     runtime_schema_path = save_runtime_schema(out_dir)
 
     time_end = time.time()
@@ -2045,11 +3120,19 @@ def run_extraction(args):
     print(f"    Feature dims   : {len(ATTR_NAMES)}")
     print(f"    Blocks         : {len(blocks)}")
     print(f"    Merged map     : {merged_path}")
-    print(f"    Default map    : {out_map}")
-    print(f"    Debug          : {out_dbg}")
+    print(f"    Default map    : {default_path}")
+    print(f"    Debug          : {dbg_path}")
+    print(f"    ACFG           : {acfg_path}")
+    print(f"    ACFG Voronoi   : {voronoi_path}")
+    if stats_path:
+        print(f"    Statistics     : {stats_path}")
+        print(f"    Top4 mask      : {top4_path}")
+        print(f"    Top6 mask      : {top6_path}")
     print(f"    Schema         : {schema_path}")
     print(f"    Runtime schema : {runtime_schema_path}")
     print(f"    APageRank      : {'enabled' if USE_APAGERANK else 'disabled'}")
+    print(f"    Sancov agg     : {args.sancov_agg_mode} gamma={args.sancov_voronoi_gamma}")
+    print(f"    Moran edge     : {args.acfg_edge_mode}")
     print(f"    Mode           : {execution['mode']}")
     print(f"    Time           : {(time_end - time_start):.2f}s")
 
@@ -2064,6 +3147,11 @@ def main(args=None):
             args = parse_cli_args([])
         else:
             args = parse_cli_args(sys.argv[1:])
+
+    # ``--self-test-acfg-stats`` runs entirely on Python stdlib and must
+    # NOT touch IDA. Handle it before bootstrap.
+    if getattr(args, "self_test_acfg_stats", False):
+        return run_acfg_self_tests()
 
     bootstrap_ida_environment(args)
 
