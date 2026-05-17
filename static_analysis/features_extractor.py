@@ -1635,15 +1635,39 @@ def compute_acfg_feature_statistics(blocks, schema_features, node_order, adj,
             "sign": sign,
         })
 
-    # Rank by abs(acfg_rds) descending; deterministic tie-break on feature_id.
+    # Rank by abs(acfg_rds) descending; tie-break uses schema order so
+    # the resulting order is fully deterministic (plan decision 4).
+    ranked = rank_acfg_stats_by_abs(stats, schema_features)
+    # Backfill rank into the schema-ordered list too (rows are shared dicts).
+    return stats, ranked
+
+
+def rank_acfg_stats_by_abs(stats, schema_features):
+    """Sort ``stats`` by ``abs_acfg_rds`` descending with schema tie-break.
+
+    Plan decision 4: when two rows have identical ``abs_acfg_rds``, the
+    one whose ``feature_id`` appears earlier in ``schema_features`` wins.
+    Rows whose ``feature_id`` is not in the schema sort after every
+    schema feature, preserving their relative order.
+
+    The function annotates each row in place with ``rank_by_abs_acfg_rds``
+    (1-based) and returns a new list referencing the same dicts in ranked
+    order. Negative ``acfg_rds`` rows are not filtered: ranking depends
+    only on magnitude, never on sign.
+    """
+    schema_index = {
+        spec["id"]: idx for idx, spec in enumerate(schema_features)
+    }
     ranked = sorted(
         stats,
-        key=lambda row: (-row["abs_acfg_rds"], row["feature_id"]),
+        key=lambda row: (
+            -row["abs_acfg_rds"],
+            schema_index.get(row["feature_id"], 10**9),
+        ),
     )
     for idx, row in enumerate(ranked, start=1):
         row["rank_by_abs_acfg_rds"] = idx
-    # Backfill rank into the schema-ordered list too (rows are shared dicts).
-    return stats, ranked
+    return ranked
 
 
 def vec_mask_from_feature_ids(schema_features, selected_feature_ids):
@@ -1994,6 +2018,23 @@ def save_acfg_statistics_json(out_dir, base, target_name, schema_features,
     top4_mask = vec_mask_from_feature_ids(schema_features, top4_ids)
     top6_mask = vec_mask_from_feature_ids(schema_features, top6_ids)
 
+    def _top_feature_details(rows):
+        # Preserve sign and magnitude for selected features so downstream
+        # consumers can tell whether a top-k entry came from a positive
+        # (clustered) or negative (anti-correlated / boundary-like)
+        # ACFG-RDS signal without re-reading the full feature list.
+        details = []
+        for row in rows:
+            details.append({
+                "feature_id": row["feature_id"],
+                "feature_name": row["feature_name"],
+                "acfg_rds": row["acfg_rds"],
+                "abs_acfg_rds": row["abs_acfg_rds"],
+                "sign": row["sign"],
+                "rank_by_abs_acfg_rds": row["rank_by_abs_acfg_rds"],
+            })
+        return details
+
     payload = {
         "schema_version": FEATURE_SCHEMA_VERSION,
         "kind": "bofuzz-acfg-statistics-v1",
@@ -2002,6 +2043,11 @@ def save_acfg_statistics_json(out_dir, base, target_name, schema_features,
         "moran_edge_mode": edge_mode,
         "eps": eps,
         "ranking_metric": "abs_acfg_rds",
+        "ranking_semantics": (
+            "features are ranked by absolute signed ACFG-RDS; "
+            "sign is preserved for interpretation"
+        ),
+        "negative_scores_allowed_in_topk": True,
         "n_blocks": n_nodes,
         "n_edges": n_edges,
         "features": features_in_schema_order,
@@ -2009,11 +2055,13 @@ def save_acfg_statistics_json(out_dir, base, target_name, schema_features,
             "selection_rule": "largest abs(acfg_rds)",
             "vec_mask": top4_mask,
             "features": top4_ids,
+            "feature_details": _top_feature_details(top4),
         },
         "top6": {
             "selection_rule": "largest abs(acfg_rds)",
             "vec_mask": top6_mask,
             "features": top6_ids,
+            "feature_details": _top_feature_details(top6),
         },
         "runtime_map_aggregation": runtime_map_meta,
     }
@@ -2296,6 +2344,98 @@ def run_acfg_self_tests():
           src_idx not in vor_oe.get(dst_idx, []),
           f"got {vor_oe}")
 
+    # ------------------------------------------------------------------
+    # Plan section 4 — abs(ACFG-RDS) ranking and top-k mask tests.
+    # ------------------------------------------------------------------
+    schema16 = _build_runtime_schema()["features"]
+
+    def _mk_row(fid, rds):
+        # Build the minimal subset of fields the ranking helper needs.
+        return {
+            "feature_id": fid,
+            "acfg_rds": rds,
+            "abs_acfg_rds": abs(rds),
+            "sign": "positive" if rds > 0 else "negative" if rds < 0 else "zero",
+        }
+
+    print("[self-test] abs-ranking: negative feature can outrank positive")
+    stats_neg = [
+        _mk_row("I00", 0.10),
+        _mk_row("I01", -0.50),
+    ]
+    ranked_neg = rank_acfg_stats_by_abs(stats_neg, schema16)
+    check("|-0.50| outranks |+0.10| -> I01 first",
+          ranked_neg[0]["feature_id"] == "I01"
+          and ranked_neg[1]["feature_id"] == "I00",
+          f"got {[r['feature_id'] for r in ranked_neg]}")
+    check("rank_by_abs_acfg_rds is 1-based and assigned",
+          ranked_neg[0]["rank_by_abs_acfg_rds"] == 1
+          and ranked_neg[1]["rank_by_abs_acfg_rds"] == 2,
+          f"got {[r['rank_by_abs_acfg_rds'] for r in ranked_neg]}")
+
+    print("[self-test] abs-ranking: top-k can include negative features")
+    stats_topk_neg = [
+        _mk_row("S00", -0.30),
+        _mk_row("S01", 0.20),
+        _mk_row("S02", -0.10),
+        _mk_row("S03", 0.05),
+    ]
+    ranked_topk = rank_acfg_stats_by_abs(stats_topk_neg, schema16)
+    top2_ids = [row["feature_id"] for row in ranked_topk[:2]]
+    check("top2 by |rds| == ['S00', 'S01'] (S00 is negative)",
+          top2_ids == ["S00", "S01"], f"got {top2_ids}")
+
+    print("[self-test] abs-ranking: zero feature falls last")
+    stats_zero = [
+        _mk_row("I00", 0.0),
+        _mk_row("I01", 0.01),
+        _mk_row("I02", -0.02),
+    ]
+    ranked_zero = rank_acfg_stats_by_abs(stats_zero, schema16)
+    order_zero = [row["feature_id"] for row in ranked_zero]
+    check("order is ['I02', 'I01', 'I00']",
+          order_zero == ["I02", "I01", "I00"], f"got {order_zero}")
+    check("zero-score feature has sign='zero'",
+          ranked_zero[-1]["sign"] == "zero",
+          f"got {ranked_zero[-1]['sign']}")
+
+    print("[self-test] abs-ranking: deterministic schema-order tie-break")
+    stats_tie = [
+        # Reverse declaration order on purpose — schema order must still win.
+        _mk_row("I01", -0.10),
+        _mk_row("I00", 0.10),
+    ]
+    ranked_tie = rank_acfg_stats_by_abs(stats_tie, schema16)
+    tie_order = [row["feature_id"] for row in ranked_tie]
+    check("tie-break by schema order -> ['I00', 'I01']",
+          tie_order == ["I00", "I01"], f"got {tie_order}")
+
+    print("[self-test] abs-ranking: top4 mask follows abs ordering")
+    # Synthetic top4 selection I01, S00, S03, S06 — verify the resulting
+    # vec_mask reflects exactly those positions in schema order.
+    expected_mask = "0100000010010010"
+    mask_top4 = vec_mask_from_feature_ids(
+        schema16, ["I01", "S00", "S03", "S06"],
+    )
+    check("top4 mask == 0100000010010010",
+          mask_top4 == expected_mask,
+          f"got {mask_top4}")
+
+    print("[self-test] abs-ranking: no group quota, instructions can dominate")
+    stats_no_quota = [
+        _mk_row("I00", -0.90),
+        _mk_row("I01", 0.80),
+        _mk_row("I02", -0.70),
+        _mk_row("I03", 0.60),
+        _mk_row("S00", 0.10),
+        _mk_row("S01", 0.09),
+    ]
+    ranked_nq = rank_acfg_stats_by_abs(stats_no_quota, schema16)
+    top4_nq_ids = [row["feature_id"] for row in ranked_nq[:4]]
+    check("top4 == ['I00','I01','I02','I03'] (no structural quota)",
+          top4_nq_ids == ["I00", "I01", "I02", "I03"],
+          f"got {top4_nq_ids}")
+
     if failures:
         print(f"\n[self-test] FAILED ({len(failures)} failures)")
         for f in failures:
@@ -2308,29 +2448,43 @@ def run_acfg_self_tests():
 
 
 def save_acfg_feature_ranking_debug(out_dir, base, ranked_stats):
-    """Optional human-readable per-feature ranking dump."""
+    """Optional human-readable per-feature ranking dump.
+
+    Columns follow plan section 3 step 6: rank, feature_id, feature_name,
+    signed ``acfg_rds``, ``abs_acfg_rds``, ``sign``, ``gini`` and
+    ``moran_i``. Rows are emitted in abs-ranking order, so the file is
+    safe to consume as the canonical ranking text export.
+    """
     out_path = os.path.join(out_dir, f"{base}_acfg_feature_ranking.txt")
+    header_fmt = (
+        "{:<5s} {:<11s} {:<28s} "
+        "{:>14s} {:>14s} {:>8s} {:>14s} {:>14s} {:>5s}\n"
+    )
+    row_fmt = (
+        "{:<5d} {:<11s} {:<28s} "
+        "{:>+14.6f} {:>14.6f} {:>8s} {:>14.6f} {:>+14.6f} {:>5d}\n"
+    )
     with open(out_path, "w") as f:
         f.write(
-            "{:<5s} {:<28s} {:<11s} {:>14s} {:>14s} {:>14s} {:>14s} {:>5s} {:>8s}\n".format(
-                "rank", "feature_name", "feature_id",
-                "moran_i", "gini", "acfg_rds", "abs_rds",
-                "act", "sign",
+            header_fmt.format(
+                "rank", "feature_id", "feature_name",
+                "acfg_rds", "abs_acfg_rds", "sign",
+                "gini", "moran_i", "act",
             )
         )
-        f.write("-" * 124 + "\n")
+        f.write("-" * 132 + "\n")
         for row in ranked_stats:
             f.write(
-                "{:<5d} {:<28s} {:<11s} {:>14.6f} {:>14.6f} {:>14.6f} {:>14.6f} {:>5d} {:>8s}\n".format(
+                row_fmt.format(
                     row["rank_by_abs_acfg_rds"],
-                    row["feature_name"],
                     row["feature_id"],
-                    row["moran_i_rank_strength"],
-                    row["gini_strength"],
+                    row["feature_name"],
                     row["acfg_rds"],
                     row["abs_acfg_rds"],
-                    row["active_count"],
                     row["sign"],
+                    row["gini_strength"],
+                    row["moran_i_rank_strength"],
+                    row["active_count"],
                 )
             )
     if VERBOSE:
