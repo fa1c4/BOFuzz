@@ -113,8 +113,8 @@ deterministic: uniform first, then one-hot candidates in active schema order.
 
 1. Build the fuzzer (see Build section above).
 2. Compile your target with the BOFuzz instrumentor (`libafl_cc`/`libafl_cxx`) to get an instrumented binary.
-3. Run the static analysis script to extract `{target}_features_map.json`. Dependencies: IDA Pro.
-   Place the features map in the same directory as the target binary.
+3. Run the static analysis script to extract the feature artifacts (see [Static Feature Extraction](#static-feature-extraction)).
+   Place the artifacts in the same directory as the target binary.
 4. Run:
 
 ```shell
@@ -135,6 +135,147 @@ cd example
 chmod +x zlib_uncompress_demo.sh
 ./zlib_uncompress_demo.sh
 ```
+
+## Static Feature Extraction
+
+`static_analysis/features_extractor.py` builds the target-only ACFG, computes
+ACFG-RDS feature statistics, partitions the ACFG into directed-successor
+Voronoi regions around sancov sites, and emits the sancov-aligned runtime
+feature map.
+
+**Prerequisites**
+
+- IDA Pro 9.x with IDALIB enabled (run `py-activate-idalib.py` once to install
+  the PyPI `idapro` shim).
+- Pure Python stdlib only — no `numpy` / `scipy` / `networkx` / `pandas`.
+
+### Run on a single bench target
+
+The extractor writes outputs into `dirname(--input-file)` by default, so omit
+`--output-dir` if you want the artifacts to land next to the binary.
+
+```shell
+# Outputs land in benchs/lcms/ alongside cms_transform_fuzzer
+python3 static_analysis/features_extractor.py \
+    --idapro --ida-dir /path/to/ida-pro-9.3 \
+    --input-file benchs/lcms/cms_transform_fuzzer
+```
+
+Pass an explicit `--output-dir` to redirect artifacts elsewhere:
+
+```shell
+python3 static_analysis/features_extractor.py \
+    --idapro --ida-dir /path/to/ida-pro-9.3 \
+    --input-file benchs/lcms/cms_transform_fuzzer \
+    --output-dir /tmp/cms_features
+```
+
+### Run on every bench target
+
+The benchs/ canonical targets (one per directory) are:
+
+```
+benchs/bloaty/fuzz_target
+benchs/curl/curl_fuzzer_http
+benchs/freetype2/ftfuzzer
+benchs/harfbuzz/hb-shape-fuzzer
+benchs/lcms/cms_transform_fuzzer
+benchs/libpng/libpng_read_fuzzer
+benchs/libxml2/xml
+benchs/mbedtls/fuzz_dtlsclient
+benchs/openssl/x509
+benchs/openthread/ot-ip6-send-fuzzer
+benchs/proj4/proj_crs_to_crs_fuzzer
+benchs/re2/fuzzer
+benchs/vorbis/decode_fuzzer
+benchs/zlib/zlib_uncompress_fuzzer
+```
+
+The following loop extracts features for all of them, storing each target's
+outputs in its own `benchs/<bench>/` directory (i.e. next to the binary):
+
+```shell
+declare -A TARGETS=(
+    [bloaty]=fuzz_target
+    [curl]=curl_fuzzer_http
+    [freetype2]=ftfuzzer
+    [harfbuzz]=hb-shape-fuzzer
+    [lcms]=cms_transform_fuzzer
+    [libpng]=libpng_read_fuzzer
+    [libxml2]=xml
+    [mbedtls]=fuzz_dtlsclient
+    [openssl]=x509
+    [openthread]=ot-ip6-send-fuzzer
+    [proj4]=proj_crs_to_crs_fuzzer
+    [re2]=fuzzer
+    [vorbis]=decode_fuzzer
+    [zlib]=zlib_uncompress_fuzzer
+)
+
+for bench in "${!TARGETS[@]}"; do
+    tgt="${TARGETS[$bench]}"
+    bin="benchs/${bench}/${tgt}"
+    [ -f "$bin" ] || { echo "SKIP $bin"; continue; }
+
+    echo "=== Extracting $bench/$tgt ==="
+    python3 static_analysis/features_extractor.py \
+        --idapro --ida-dir /path/to/ida-pro-9.3 \
+        --input-file "$bin"
+done
+```
+
+### Artifacts produced per target
+
+For target `<base>` (e.g. `cms_transform_fuzzer`) the extractor writes to the
+binary's directory:
+
+| File | Purpose |
+|---|---|
+| `<base>_features_map.json` | **Runtime input.** 16-key map; each value is an array of length `sancov_sites` (directed-successor Voronoi weighted-mean of normalized features, γ=0.5) |
+| `<base>_features_map_<name>.json` | Per-feature copy of the above (one file per `name` in `ATTR_NAMES`) |
+| `<base>_features_map_default.json` | Per-sancov `directional_weight` over the aggregated 16-D vector |
+| `<base>_features_map.debug.json` | Per-sancov debug record with seed-node, Voronoi region size, aggregated norm vector |
+| `<base>_acfg.json` | Full target-only ACFG: stable node indexes, raw/norm attrs, directed edges |
+| `<base>_acfg_voronoi.json` | Per-region listing: seed PC, seed node, region nodes, max/mean distance, unassigned counts |
+| `<base>_statistics.json` | Per-feature ACFG-RDS = MoranI(rank(z)) · Gini(z); ranking by `abs(acfg_rds)`; top4/top6 vec masks; runtime aggregation metadata |
+| `<base>_acfg_rds_top4_vec_mask.txt` | 16-char `0/1` mask of the four top-clustered features (largest `abs(acfg_rds)`) |
+| `<base>_acfg_rds_top6_vec_mask.txt` | 16-char mask of the top six clustered features |
+| `<base>_acfg_feature_ranking.txt` | Human-readable per-feature MoranI / Gini / RDS / sign table |
+| `<base>_features_schema.json` | Target-side schema with execution metadata |
+| `features_schema.json` | Canonical runtime schema (same content as `static_analysis/features_schema.json`) |
+
+The runtime fuzzer only needs `<base>_features_map.json` + `features_schema.json`;
+the rest support feature-ranking analysis and reproducibility.
+
+### Key extractor flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--idapro` | off | Use PyPI `idapro` / IDALIB instead of running inside IDA |
+| `--ida-dir` | `$IDADIR` | IDA install directory (sets `IDADIR` before `import idapro`) |
+| `--input-file` | required for `--idapro` | Path to the target binary |
+| `--output-dir` | `dirname(--input-file)` | Where to write artifacts |
+| `--feature-mode` | `both` | `both` / `semantic` / `graph` — which feature groups to keep before normalization |
+| `--acfg-edge-mode` | `directed` | Moran's I adjacency: `directed` (w_uv=1, w_vu=0) or `undirected` (symmetrized) |
+| `--acfg-stats-eps` | `1e-8` | Near-zero strength threshold for `z = |x|` |
+| `--acfg-stats-signal` | `norm` | Statistics signal source: `norm` (z-scored) or `raw` |
+| `--sancov-agg-mode` | `voronoi-weighted-mean` | Runtime aggregation; `none` falls back to direct seed values (ablation only) |
+| `--sancov-voronoi-distance` | `directed-successor` | Graph distance for Voronoi assignment |
+| `--sancov-voronoi-gamma` | `0.5` | Distance decay γ for weighted mean |
+| `--no-acfg-stats` | off | Skip `<base>_statistics.json` and top-k masks |
+| `--self-test-acfg-stats` | off | Run pure-Python self-tests for MoranI / Gini / Voronoi and exit (no IDA required) |
+
+### Sanity check without IDA
+
+```shell
+python3 static_analysis/features_extractor.py --self-test-acfg-stats
+```
+
+Validates Gini / Moran's I sign on directed clustered vs. alternating chains,
+directed-successor Voronoi partition + tie-break + unassigned blocks,
+duplicate-seed fatal path, weighted-mean closed-form (γ=0.5 ⇒
+`(1·10 + ½·20) / 1.5 = 13.333…`), and the full 4-node feature pipeline.
+Exits 0 on success.
 
 ## CLI Options
 
