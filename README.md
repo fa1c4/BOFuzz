@@ -237,10 +237,12 @@ binary's directory:
 | `<base>_features_map.debug.json` | Per-sancov debug record with seed-node, Voronoi region size, aggregated norm vector |
 | `<base>_acfg.json` | Full target-only ACFG: stable node indexes, raw/norm attrs, directed edges |
 | `<base>_acfg_voronoi.json` | Per-region listing: seed PC, seed node, region nodes, max/mean distance, unassigned counts |
-| `<base>_statistics.json` | Per-feature ACFG-RDS = MoranI(rank(z)) · Gini(z); ranking by `abs(acfg_rds)`; top4/top6 vec masks; runtime aggregation metadata |
+| `<base>_statistics.json` | Per-feature ACFG-RDS = MoranI(rank(z)) · Gini(z); ranking by `abs(acfg_rds)` and `gini_strength`; three ablation selection views (`top6_abs_acfg_rds`, `top6_gini`, `random6`) plus legacy `top4`; runtime aggregation metadata |
 | `<base>_acfg_rds_top4_vec_mask.txt` | 16-char `0/1` mask of the four top-clustered features (largest `abs(acfg_rds)`) |
-| `<base>_acfg_rds_top6_vec_mask.txt` | 16-char mask of the top six clustered features |
-| `<base>_acfg_feature_ranking.txt` | Human-readable per-feature MoranI / Gini / RDS / sign table |
+| `<base>_top6_abs_acfg_rds_vec_mask.txt` | 16-char mask: top 6 by `abs(acfg_rds)` (ACFG-RDS ablation baseline) |
+| `<base>_top6_gini_vec_mask.txt` | 16-char mask: top 6 by `gini_strength` only (Gini-only ablation view) |
+| `<base>_random6_vec_mask.txt` | 16-char mask: deterministic uniform random 6 from all schema features (seeded by `--random-feature-seed`, default `0xfa1c4`) |
+| `<base>_acfg_feature_ranking.txt` | Human-readable per-feature ranking table with both `rank_abs` and `rank_gini` columns |
 | `<base>_features_schema.json` | Target-side schema with execution metadata |
 | `features_schema.json` | Canonical runtime schema (same content as `static_analysis/features_schema.json`) |
 
@@ -259,6 +261,7 @@ the rest support feature-ranking analysis and reproducibility.
 | `--acfg-edge-mode` | `directed` | Moran's I adjacency: `directed` (w_uv=1, w_vu=0) or `undirected` (symmetrized) |
 | `--acfg-stats-eps` | `1e-8` | Near-zero strength threshold for `z = |x|` |
 | `--acfg-stats-signal` | `norm` | Statistics signal source: `norm` (z-scored) or `raw` |
+| `--random-feature-seed` | `0xfa1c4` | Base seed for the deterministic `random6` feature baseline; accepts decimal or `0x`-prefixed hex |
 | `--sancov-agg-mode` | `voronoi-weighted-mean` | Runtime aggregation; `none` falls back to direct seed values (ablation only) |
 | `--sancov-voronoi-distance` | `directed-successor` | Graph distance for Voronoi assignment |
 | `--sancov-voronoi-gamma` | `0.5` | Distance decay γ for weighted mean |

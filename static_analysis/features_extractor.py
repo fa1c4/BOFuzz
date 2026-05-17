@@ -37,7 +37,9 @@ python3 static_analysis/features_extractor.py --idapro --ida-dir /data/zym/ida-p
 """
 
 import argparse
+import hashlib
 import os
+import random
 import sys
 import json
 import math
@@ -1325,9 +1327,11 @@ def compute_centrality_feature(CFG, blocks):
 
     sample_nodes = nodes
     if N > CENTRALITY_EXACT_MAX:
-        import random
-        random.seed(CENTRALITY_SAMPLE_SEED)
-        sample_nodes = random.sample(nodes, min(CENTRALITY_SAMPLE_MAX, N))
+        # Use a dedicated Random instance so the global ``random`` state is
+        # untouched (centrality sampling must not perturb the deterministic
+        # random6 baseline selection).
+        rng = random.Random(CENTRALITY_SAMPLE_SEED)
+        sample_nodes = rng.sample(nodes, min(CENTRALITY_SAMPLE_MAX, N))
 
     btw_acc = defaultdict(float)
     node_set = set(nodes)
@@ -1638,7 +1642,11 @@ def compute_acfg_feature_statistics(blocks, schema_features, node_order, adj,
     # Rank by abs(acfg_rds) descending; tie-break uses schema order so
     # the resulting order is fully deterministic (plan decision 4).
     ranked = rank_acfg_stats_by_abs(stats, schema_features)
-    # Backfill rank into the schema-ordered list too (rows are shared dicts).
+    # Also annotate every row with ``rank_by_gini`` so the Gini-only
+    # selection view does not have to recompute it later. Rows are shared
+    # dicts, so this propagates to ``stats``, ``ranked`` and any other
+    # downstream view by mutation.
+    rank_acfg_stats_by_gini(stats, schema_features)
     return stats, ranked
 
 
@@ -1674,6 +1682,119 @@ def vec_mask_from_feature_ids(schema_features, selected_feature_ids):
     """Build a 0/1 string of len(schema_features) marking selected ids."""
     selected = set(selected_feature_ids)
     return "".join("1" if spec["id"] in selected else "0" for spec in schema_features)
+
+
+# ============== SELECTION-VIEW HELPERS (ABLATION SUPPORT) ==============
+# These helpers back the three feature-selection views exposed by the
+# statistics JSON for ablation experiments (plan
+# ``bofuzz_features_selection_ablation_plan.md``):
+#
+#   top6_abs_acfg_rds  -> six features with largest ``abs(acfg_rds)``
+#   top6_gini          -> six features with largest ``gini_strength``
+#   random6            -> six features sampled uniformly without replacement
+#                         from all schema features, deterministically seeded
+#
+# No selection view changes BOFuzz runtime behavior automatically; users must
+# explicitly pass the desired vec-mask to the fuzzer.
+def build_schema_index(schema_features):
+    """Map ``feature_id`` -> position in schema order.
+
+    Used as the deterministic tie-break for every ranking helper so two rows
+    with identical primary keys always resolve to the schema-declared order
+    (``I00 < I01 < ... < S07``).
+    """
+    return {spec["id"]: idx for idx, spec in enumerate(schema_features)}
+
+
+def rank_acfg_stats_by_gini(stats, schema_features):
+    """Sort ``stats`` by ``gini_strength`` descending with schema tie-break.
+
+    Mirrors ``rank_acfg_stats_by_abs`` but ranks by Gini concentration alone.
+    Annotates each row in place with ``rank_by_gini`` (1-based) and returns
+    a new list referencing the same dicts in Gini-ranked order. No filtering
+    is applied: sign, feature group, and zero ``acfg_rds`` are all ignored.
+    """
+    schema_index = build_schema_index(schema_features)
+    ranked = sorted(
+        stats,
+        key=lambda row: (
+            -float(row.get("gini_strength", 0.0)),
+            schema_index.get(row["feature_id"], 10**9),
+        ),
+    )
+    for idx, row in enumerate(ranked, start=1):
+        row["rank_by_gini"] = idx
+    return ranked
+
+
+def stable_target_seed(target_name, base_seed):
+    """Derive a deterministic per-target seed.
+
+    Uses SHA-256 over ``"<target_name>:<base_seed>"`` and returns the first
+    eight bytes as a non-negative integer. Python's built-in ``hash()`` is
+    randomized across processes and is NOT used here.
+    """
+    payload = "{}:{}".format(target_name, int(base_seed)).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], "big", signed=False)
+
+
+def select_random6_features(schema_features, target_name, base_seed):
+    """Pick six schema features uniformly at random without replacement.
+
+    Sampling pool is the *entire* schema (no score / sign / group filtering).
+    The returned ID order preserves the random draw order; downstream
+    ``vec_mask`` generation re-orders selection into schema order, which is
+    the contract documented in the plan.
+    """
+    if len(schema_features) < 6:
+        raise RuntimeError(
+            "random6 requires at least 6 schema features, got {}".format(
+                len(schema_features)
+            )
+        )
+    derived_seed = stable_target_seed(target_name, base_seed)
+    rng = random.Random(derived_seed)
+    indices = list(range(len(schema_features)))
+    selected_indices = rng.sample(indices, 6)
+    selected_ids = [schema_features[i]["id"] for i in selected_indices]
+    return selected_ids, derived_seed
+
+
+def make_feature_selection_payload(selection_rule, rows, schema_features):
+    """Build the per-view JSON object emitted under each selection view.
+
+    Each entry in ``feature_details`` mirrors the corresponding row from
+    ``statistics["features"]`` and exposes the metrics needed for downstream
+    interpretation: signed ``acfg_rds``, ``abs_acfg_rds``, ``sign``, both
+    rank annotations and ``moran_i_rank_strength``.
+    """
+    feature_ids = [row["feature_id"] for row in rows]
+    return {
+        "selection_rule": selection_rule,
+        "vec_mask": vec_mask_from_feature_ids(schema_features, feature_ids),
+        "features": feature_ids,
+        "feature_details": [
+            {
+                "feature_id": row["feature_id"],
+                "feature_name": row.get("feature_name"),
+                "group": row.get("group"),
+                "acfg_rds": row.get("acfg_rds"),
+                "abs_acfg_rds": row.get("abs_acfg_rds"),
+                "sign": row.get("sign"),
+                "rank_by_abs_acfg_rds": row.get("rank_by_abs_acfg_rds"),
+                "gini_strength": row.get("gini_strength"),
+                "rank_by_gini": row.get("rank_by_gini"),
+                "moran_i_rank_strength": row.get("moran_i_rank_strength"),
+            }
+            for row in rows
+        ],
+    }
+
+
+def _selection_overlap_count(a, b):
+    """Cardinality of the intersection of two feature-id collections."""
+    return len(set(a) & set(b))
 
 
 # ======================= ACFG VORONOI HELPERS =======================
@@ -1996,44 +2117,106 @@ def save_acfg_voronoi_json(out_dir, base, target_name, seeds,
 def save_acfg_statistics_json(out_dir, base, target_name, schema_features,
                                 ranked_stats, n_nodes, n_edges,
                                 signal_source, edge_mode, eps,
-                                runtime_map_meta):
-    """Emit ``<base>_statistics.json`` and ``top4 / top6`` masks.
+                                runtime_map_meta,
+                                random_feature_seed=0xFA1C4):
+    """Emit ``<base>_statistics.json`` plus standalone vec-mask files.
 
-    Returns ``(stats_path, top4_path, top6_path, top4, top6)``.
+    The statistics JSON exposes multiple feature-selection views for
+    ablation experiments:
+
+      * ``top6_abs_acfg_rds`` captures the full ACFG-RDS regional-guidance
+        score (largest ``abs(acfg_rds)``).
+      * ``top6_gini`` isolates feature-strength concentration without
+        graph autocorrelation (largest ``gini_strength``).
+      * ``random6`` is a deterministic random baseline sampled uniformly
+        from all schema features.
+
+    No view changes BOFuzz runtime behavior automatically; users must
+    explicitly pass the desired vec-mask to BOFuzz. The legacy ``top4``
+    view (largest ``abs(acfg_rds)``) is kept for backward compatibility
+    with existing tooling. The ambiguous generic ``top6`` field is no
+    longer emitted; consumers should pick an explicit selection view.
+
+    Returns a dict with the statistics path, the per-view mask paths and
+    the per-view selected rows.
     """
-    # ``ranked_stats`` is the ranked view; copy back the rank into schema
-    # order for the ``features`` listing.
-    features_in_schema_order = []
+    # ``ranked_stats`` is the abs-ranked view; rebuild a schema-ordered
+    # listing for the top-level ``features`` field while keeping shared
+    # row dicts so every rank annotation propagates.
     rank_by_id = {row["feature_id"]: row for row in ranked_stats}
-    for spec in schema_features:
-        row = rank_by_id.get(spec["id"])
-        if row is None:
-            continue
-        features_in_schema_order.append(row)
+    features_in_schema_order = [
+        rank_by_id[spec["id"]]
+        for spec in schema_features
+        if spec["id"] in rank_by_id
+    ]
 
-    top4 = ranked_stats[:4]
-    top6 = ranked_stats[:6]
-    top4_ids = [row["feature_id"] for row in top4]
-    top6_ids = [row["feature_id"] for row in top6]
+    # --- top6_abs_acfg_rds: first six by abs-RDS ranking ---------------
+    top6_abs_rows = ranked_stats[:6]
+
+    # --- top6_gini: first six by Gini-only ranking ---------------------
+    # Recompute the Gini ranking here (cheap) so we never rely on a stale
+    # ordering even if ``ranked_stats`` is mutated by the caller.
+    gini_ranked = rank_acfg_stats_by_gini(ranked_stats, schema_features)
+    top6_gini_rows = gini_ranked[:6]
+
+    # --- random6: deterministic uniform sample without replacement ----
+    stats_by_id = {row["feature_id"]: row for row in ranked_stats}
+    random6_ids, derived_seed = select_random6_features(
+        schema_features, target_name, random_feature_seed,
+    )
+    missing_random_ids = [fid for fid in random6_ids if fid not in stats_by_id]
+    if missing_random_ids:
+        raise RuntimeError(
+            "random6 selected feature(s) {!r} not present in computed "
+            "statistics; this indicates a schema/feature mismatch".format(
+                missing_random_ids,
+            )
+        )
+    random6_rows = [stats_by_id[fid] for fid in random6_ids]
+
+    # Legacy top4 (out of scope of the ablation plan but still emitted for
+    # downstream tools that depend on it).
+    top4_rows = ranked_stats[:4]
+    top4_ids = [row["feature_id"] for row in top4_rows]
     top4_mask = vec_mask_from_feature_ids(schema_features, top4_ids)
-    top6_mask = vec_mask_from_feature_ids(schema_features, top6_ids)
 
-    def _top_feature_details(rows):
-        # Preserve sign and magnitude for selected features so downstream
-        # consumers can tell whether a top-k entry came from a positive
-        # (clustered) or negative (anti-correlated / boundary-like)
-        # ACFG-RDS signal without re-reading the full feature list.
-        details = []
-        for row in rows:
-            details.append({
-                "feature_id": row["feature_id"],
-                "feature_name": row["feature_name"],
-                "acfg_rds": row["acfg_rds"],
-                "abs_acfg_rds": row["abs_acfg_rds"],
-                "sign": row["sign"],
-                "rank_by_abs_acfg_rds": row["rank_by_abs_acfg_rds"],
-            })
-        return details
+    top6_abs_payload = make_feature_selection_payload(
+        "largest abs(acfg_rds)", top6_abs_rows, schema_features,
+    )
+    top6_gini_payload = make_feature_selection_payload(
+        "largest gini_strength", top6_gini_rows, schema_features,
+    )
+    random6_payload = make_feature_selection_payload(
+        "uniform random sample without replacement from all schema features",
+        random6_rows,
+        schema_features,
+    )
+    # Inject the deterministic seed metadata before the generic fields so
+    # readers see provenance up-front.
+    random6_seed_meta = {
+        "random_feature_seed": "0x{:x}".format(int(random_feature_seed)),
+        "random_feature_seed_int": int(random_feature_seed),
+        "derived_seed": int(derived_seed),
+    }
+    random6_payload = {
+        "selection_rule": random6_payload["selection_rule"],
+        **random6_seed_meta,
+        "vec_mask": random6_payload["vec_mask"],
+        "features": random6_payload["features"],
+        "feature_details": random6_payload["feature_details"],
+    }
+
+    selection_view_overlap = {
+        "top6_abs_vs_gini": _selection_overlap_count(
+            top6_abs_payload["features"], top6_gini_payload["features"],
+        ),
+        "top6_abs_vs_random6": _selection_overlap_count(
+            top6_abs_payload["features"], random6_payload["features"],
+        ),
+        "top6_gini_vs_random6": _selection_overlap_count(
+            top6_gini_payload["features"], random6_payload["features"],
+        ),
+    }
 
     payload = {
         "schema_version": FEATURE_SCHEMA_VERSION,
@@ -2048,6 +2231,23 @@ def save_acfg_statistics_json(out_dir, base, target_name, schema_features,
             "sign is preserved for interpretation"
         ),
         "negative_scores_allowed_in_topk": True,
+        "selection_views": {
+            "available": [
+                "top6_abs_acfg_rds",
+                "top6_gini",
+                "random6",
+            ],
+            "runtime_default": None,
+            "runtime_semantics": (
+                "No selection view changes runtime behavior automatically; "
+                "BOFuzz uses the vec-mask explicitly passed by the user."
+            ),
+            "analysis_note": (
+                "top6_abs_acfg_rds, top6_gini, and random6 are emitted "
+                "for ablation experiments."
+            ),
+        },
+        "selection_view_overlap": selection_view_overlap,
         "n_blocks": n_nodes,
         "n_edges": n_edges,
         "features": features_in_schema_order,
@@ -2055,14 +2255,21 @@ def save_acfg_statistics_json(out_dir, base, target_name, schema_features,
             "selection_rule": "largest abs(acfg_rds)",
             "vec_mask": top4_mask,
             "features": top4_ids,
-            "feature_details": _top_feature_details(top4),
+            "feature_details": [
+                {
+                    "feature_id": row["feature_id"],
+                    "feature_name": row["feature_name"],
+                    "acfg_rds": row["acfg_rds"],
+                    "abs_acfg_rds": row["abs_acfg_rds"],
+                    "sign": row["sign"],
+                    "rank_by_abs_acfg_rds": row["rank_by_abs_acfg_rds"],
+                }
+                for row in top4_rows
+            ],
         },
-        "top6": {
-            "selection_rule": "largest abs(acfg_rds)",
-            "vec_mask": top6_mask,
-            "features": top6_ids,
-            "feature_details": _top_feature_details(top6),
-        },
+        "top6_abs_acfg_rds": top6_abs_payload,
+        "top6_gini": top6_gini_payload,
+        "random6": random6_payload,
         "runtime_map_aggregation": runtime_map_meta,
     }
     stats_path = os.path.join(out_dir, f"{base}_statistics.json")
@@ -2074,14 +2281,39 @@ def save_acfg_statistics_json(out_dir, base, target_name, schema_features,
     top4_path = os.path.join(out_dir, f"{base}_acfg_rds_top4_vec_mask.txt")
     with open(top4_path, "w") as f:
         f.write(top4_mask + "\n")
-    top6_path = os.path.join(out_dir, f"{base}_acfg_rds_top6_vec_mask.txt")
-    with open(top6_path, "w") as f:
-        f.write(top6_mask + "\n")
-    if VERBOSE:
-        print(f"[+] Saved top4 vec mask -> {top4_path}")
-        print(f"[+] Saved top6 vec mask -> {top6_path}")
 
-    return stats_path, top4_path, top6_path, top4, top6
+    top6_abs_path = os.path.join(
+        out_dir, f"{base}_top6_abs_acfg_rds_vec_mask.txt",
+    )
+    with open(top6_abs_path, "w") as f:
+        f.write(top6_abs_payload["vec_mask"] + "\n")
+
+    top6_gini_path = os.path.join(out_dir, f"{base}_top6_gini_vec_mask.txt")
+    with open(top6_gini_path, "w") as f:
+        f.write(top6_gini_payload["vec_mask"] + "\n")
+
+    random6_path = os.path.join(out_dir, f"{base}_random6_vec_mask.txt")
+    with open(random6_path, "w") as f:
+        f.write(random6_payload["vec_mask"] + "\n")
+
+    if VERBOSE:
+        print(f"[+] Saved top4 vec mask           -> {top4_path}")
+        print(f"[+] Saved top6_abs_acfg_rds mask  -> {top6_abs_path}")
+        print(f"[+] Saved top6_gini mask          -> {top6_gini_path}")
+        print(f"[+] Saved random6 mask            -> {random6_path}")
+
+    return {
+        "stats_path": stats_path,
+        "top4_mask_path": top4_path,
+        "top6_abs_acfg_rds_mask_path": top6_abs_path,
+        "top6_gini_mask_path": top6_gini_path,
+        "random6_mask_path": random6_path,
+        "top4_rows": top4_rows,
+        "top6_abs_acfg_rds_rows": top6_abs_rows,
+        "top6_gini_rows": top6_gini_rows,
+        "random6_rows": random6_rows,
+        "random6_derived_seed": derived_seed,
+    }
 
 
 class _MockBlock(object):
@@ -2436,6 +2668,219 @@ def run_acfg_self_tests():
           top4_nq_ids == ["I00", "I01", "I02", "I03"],
           f"got {top4_nq_ids}")
 
+    # ------------------------------------------------------------------
+    # Plan bofuzz_features_selection_ablation_plan.md — selection views.
+    # ------------------------------------------------------------------
+    def _mk_row_full(fid, rds, gini, mi=0.0):
+        return {
+            "feature_id": fid,
+            "feature_name": fid,
+            "group": "instruction" if fid.startswith("I") else "structural",
+            "acfg_rds": rds,
+            "abs_acfg_rds": abs(rds),
+            "sign": "positive" if rds > 0 else "negative" if rds < 0 else "zero",
+            "gini_strength": gini,
+            "moran_i_rank_strength": mi,
+        }
+
+    print("[self-test] stable_target_seed: deterministic and varies by inputs")
+    s1 = stable_target_seed("foo", 0xFA1C4)
+    s2 = stable_target_seed("foo", 0xFA1C4)
+    s3 = stable_target_seed("bar", 0xFA1C4)
+    s4 = stable_target_seed("foo", 0xFA1C5)
+    check("same target+seed -> same derived seed", s1 == s2, f"got {s1} vs {s2}")
+    check("different target -> different derived seed",
+          s1 != s3, f"got {s1} vs {s3}")
+    check("different base seed -> different derived seed",
+          s1 != s4, f"got {s1} vs {s4}")
+    check("derived seed fits in 64-bit unsigned",
+          0 <= s1 < (1 << 64), f"got {s1}")
+
+    print("[self-test] rank_by_gini: descending with schema tie-break")
+    gini_rows = [
+        _mk_row_full("I00", 0.0, 0.20),
+        _mk_row_full("I01", 0.0, 0.50),
+        _mk_row_full("I02", 0.0, 0.50),  # ties I01 by gini, but later in schema
+        _mk_row_full("S00", 0.0, 0.10),
+    ]
+    ranked_g = rank_acfg_stats_by_gini(gini_rows, schema16)
+    order_g = [row["feature_id"] for row in ranked_g]
+    check("gini ranking order is ['I01','I02','I00','S00']",
+          order_g == ["I01", "I02", "I00", "S00"], f"got {order_g}")
+    check("rank_by_gini is 1-based and assigned",
+          [r["rank_by_gini"] for r in ranked_g] == [1, 2, 3, 4],
+          f"got {[r['rank_by_gini'] for r in ranked_g]}")
+
+    print("[self-test] select_random6_features: deterministic across runs")
+    ids_a, derived_a = select_random6_features(schema16, "tgt", 0xFA1C4)
+    ids_b, derived_b = select_random6_features(schema16, "tgt", 0xFA1C4)
+    check("random6 same target+seed -> same id sequence",
+          ids_a == ids_b, f"got {ids_a} vs {ids_b}")
+    check("random6 same target+seed -> same derived seed",
+          derived_a == derived_b, f"got {derived_a} vs {derived_b}")
+    check("random6 returns exactly six features",
+          len(ids_a) == 6, f"got {len(ids_a)}")
+    check("random6 features are unique",
+          len(set(ids_a)) == 6, f"got {ids_a}")
+    valid_ids = {spec["id"] for spec in schema16}
+    check("random6 features are valid schema IDs",
+          set(ids_a).issubset(valid_ids), f"got {ids_a}")
+
+    print("[self-test] random6 varies with target name and seed")
+    ids_c, _ = select_random6_features(schema16, "other", 0xFA1C4)
+    ids_d, _ = select_random6_features(schema16, "tgt", 0xFA1C5)
+    # Different targets / seeds are not guaranteed to produce a different
+    # 6-of-16 multiset (collisions are possible) but in practice these
+    # specific inputs do differ; the strong contract is just that the
+    # derived seed is different.
+    check("random6 different target derives different seed",
+          stable_target_seed("tgt", 0xFA1C4)
+          != stable_target_seed("other", 0xFA1C4),
+          "derived seeds collided")
+    check("random6 different base seed derives different seed",
+          stable_target_seed("tgt", 0xFA1C4)
+          != stable_target_seed("tgt", 0xFA1C5),
+          "derived seeds collided")
+
+    print("[self-test] make_feature_selection_payload: structure + vec_mask")
+    payload_rows = [
+        _mk_row_full("S02", 0.30, 0.40),
+        _mk_row_full("I00", -0.20, 0.10),
+    ]
+    # Annotate ranks on each row so feature_details has them.
+    rank_acfg_stats_by_abs(payload_rows, schema16)
+    rank_acfg_stats_by_gini(payload_rows, schema16)
+    pl = make_feature_selection_payload("test rule", payload_rows, schema16)
+    check("payload features preserve input order",
+          pl["features"] == ["S02", "I00"], f"got {pl['features']}")
+    expected_pl_mask = vec_mask_from_feature_ids(schema16, ["S02", "I00"])
+    check("payload vec_mask matches schema-order recomputation",
+          pl["vec_mask"] == expected_pl_mask,
+          f"got {pl['vec_mask']} expected {expected_pl_mask}")
+    check("payload feature_details has all required fields",
+          all(
+              {"feature_id", "feature_name", "group", "acfg_rds",
+               "abs_acfg_rds", "sign", "rank_by_abs_acfg_rds",
+               "gini_strength", "rank_by_gini",
+               "moran_i_rank_strength"}.issubset(fd.keys())
+              for fd in pl["feature_details"]
+          ), f"got {pl['feature_details']}")
+
+    print("[self-test] save_acfg_statistics_json: full selection-view contract")
+    # Synthesize a tiny but full schema and ranked stats so we can exercise
+    # save_acfg_statistics_json end-to-end without an IDA dependency.
+    import tempfile
+    synth_rows = []
+    schema_ids = [spec["id"] for spec in schema16]
+    # Give each feature a unique rds and gini so ranks are total orders.
+    for i, fid in enumerate(schema_ids):
+        # I03 deliberately gets a high gini but moderate rds so the top6
+        # views diverge (covers Decision 4 + overlap metadata).
+        if fid == "I03":
+            rds, gini = 0.05, 0.95
+        else:
+            rds = 0.5 - i * 0.01
+            gini = 0.30 + (i * 0.001)
+        synth_rows.append(_mk_row_full(fid, rds, gini, mi=rds / 2.0))
+
+    ranked_synth = rank_acfg_stats_by_abs(synth_rows, schema16)
+    rank_acfg_stats_by_gini(synth_rows, schema16)
+    with tempfile.TemporaryDirectory() as tmp:
+        result = save_acfg_statistics_json(
+            tmp, "synthetic", "synthetic_target", schema16,
+            ranked_synth, n_nodes=42, n_edges=87,
+            signal_source="norm", edge_mode="directed", eps=1e-8,
+            runtime_map_meta={"mode": "voronoi-weighted-mean"},
+            random_feature_seed=0xFA1C4,
+        )
+        with open(result["stats_path"]) as fh:
+            stats_obj = json.load(fh)
+
+        check("no generic top6 field emitted",
+              "top6" not in stats_obj, f"keys={sorted(stats_obj.keys())}")
+        for key in ("top6_abs_acfg_rds", "top6_gini", "random6",
+                    "selection_views", "selection_view_overlap"):
+            check(f"statistics JSON has {key!r}",
+                  key in stats_obj, f"keys={sorted(stats_obj.keys())}")
+
+        # Decision 5 + Step 5: top6_abs_acfg_rds matches first 6 of abs ranking.
+        expected_abs_ids = [row["feature_id"] for row in ranked_synth[:6]]
+        check("top6_abs_acfg_rds.features == first six abs-ranked",
+              stats_obj["top6_abs_acfg_rds"]["features"] == expected_abs_ids,
+              f"got {stats_obj['top6_abs_acfg_rds']['features']}")
+
+        # Decision 4 + Step 6: top6_gini matches first 6 by Gini-only ranking.
+        gini_sorted = sorted(
+            synth_rows,
+            key=lambda r: (-r["gini_strength"],
+                           build_schema_index(schema16).get(
+                               r["feature_id"], 10**9)),
+        )
+        expected_gini_ids = [r["feature_id"] for r in gini_sorted[:6]]
+        check("top6_gini.features == first six gini-ranked",
+              stats_obj["top6_gini"]["features"] == expected_gini_ids,
+              f"got {stats_obj['top6_gini']['features']}")
+        # In this synthesis I03 has the largest gini so it MUST show up in
+        # top6_gini but not necessarily in top6_abs_acfg_rds.
+        check("synthetic I03 is in top6_gini",
+              "I03" in stats_obj["top6_gini"]["features"],
+              f"got {stats_obj['top6_gini']['features']}")
+
+        # Decision 6/7: random6 metadata is deterministic.
+        rnd = stats_obj["random6"]
+        check("random6.random_feature_seed == '0xfa1c4'",
+              rnd["random_feature_seed"] == "0xfa1c4",
+              f"got {rnd.get('random_feature_seed')!r}")
+        check("random6.random_feature_seed_int == int('0xfa1c4', 16)",
+              rnd["random_feature_seed_int"] == int("0xfa1c4", 16),
+              f"got {rnd.get('random_feature_seed_int')!r}")
+        check("random6.derived_seed matches stable_target_seed",
+              rnd["derived_seed"]
+              == stable_target_seed("synthetic_target", 0xFA1C4),
+              f"got {rnd.get('derived_seed')!r}")
+        check("random6.features has six unique schema IDs",
+              len(rnd["features"]) == 6 and len(set(rnd["features"])) == 6,
+              f"got {rnd['features']}")
+
+        # vec_mask recomputes for every view (plan test 6).
+        for view in ("top6_abs_acfg_rds", "top6_gini", "random6"):
+            recomputed = vec_mask_from_feature_ids(
+                schema16, stats_obj[view]["features"],
+            )
+            check(f"{view}.vec_mask recomputes from schema order",
+                  stats_obj[view]["vec_mask"] == recomputed,
+                  f"got {stats_obj[view]['vec_mask']} expected {recomputed}")
+
+        # selection_views metadata is exactly as locked in by decision 10.
+        sv = stats_obj["selection_views"]
+        check("selection_views.available is the locked triple",
+              sv["available"]
+              == ["top6_abs_acfg_rds", "top6_gini", "random6"],
+              f"got {sv.get('available')}")
+        check("selection_views.runtime_default is null",
+              sv["runtime_default"] is None,
+              f"got {sv.get('runtime_default')!r}")
+
+        # selection_view_overlap is a non-negative int trio.
+        ov = stats_obj["selection_view_overlap"]
+        for k in ("top6_abs_vs_gini", "top6_abs_vs_random6",
+                  "top6_gini_vs_random6"):
+            check(f"selection_view_overlap.{k} is in [0, 6]",
+                  isinstance(ov.get(k), int) and 0 <= ov[k] <= 6,
+                  f"got {ov.get(k)!r}")
+
+        # Standalone mask files match the JSON (plan decision 8 / step 12).
+        for view, path_key in (
+            ("top6_abs_acfg_rds", "top6_abs_acfg_rds_mask_path"),
+            ("top6_gini",         "top6_gini_mask_path"),
+            ("random6",           "random6_mask_path"),
+        ):
+            with open(result[path_key]) as fh:
+                disk_mask = fh.read().strip()
+            check(f"{view} standalone mask file matches JSON vec_mask",
+                  disk_mask == stats_obj[view]["vec_mask"],
+                  f"file={disk_mask} json={stats_obj[view]['vec_mask']}")
+
     if failures:
         print(f"\n[self-test] FAILED ({len(failures)} failures)")
         for f in failures:
@@ -2450,33 +2895,34 @@ def run_acfg_self_tests():
 def save_acfg_feature_ranking_debug(out_dir, base, ranked_stats):
     """Optional human-readable per-feature ranking dump.
 
-    Columns follow plan section 3 step 6: rank, feature_id, feature_name,
-    signed ``acfg_rds``, ``abs_acfg_rds``, ``sign``, ``gini`` and
-    ``moran_i``. Rows are emitted in abs-ranking order, so the file is
-    safe to consume as the canonical ranking text export.
+    Rows are emitted in abs-ranking order, so the file is safe to consume
+    as the canonical ranking text export. Both the abs-RDS rank
+    (``rank_abs``) and the Gini-only rank (``rank_gini``) are included so
+    the file is also useful when inspecting Gini-only ablation runs.
     """
     out_path = os.path.join(out_dir, f"{base}_acfg_feature_ranking.txt")
     header_fmt = (
-        "{:<5s} {:<11s} {:<28s} "
+        "{:<9s} {:<10s} {:<11s} {:<28s} "
         "{:>14s} {:>14s} {:>8s} {:>14s} {:>14s} {:>5s}\n"
     )
     row_fmt = (
-        "{:<5d} {:<11s} {:<28s} "
+        "{:<9d} {:<10d} {:<11s} {:<28s} "
         "{:>+14.6f} {:>14.6f} {:>8s} {:>14.6f} {:>+14.6f} {:>5d}\n"
     )
     with open(out_path, "w") as f:
         f.write(
             header_fmt.format(
-                "rank", "feature_id", "feature_name",
+                "rank_abs", "rank_gini", "feature_id", "feature_name",
                 "acfg_rds", "abs_acfg_rds", "sign",
                 "gini", "moran_i", "act",
             )
         )
-        f.write("-" * 132 + "\n")
+        f.write("-" * 142 + "\n")
         for row in ranked_stats:
             f.write(
                 row_fmt.format(
                     row["rank_by_abs_acfg_rds"],
+                    row.get("rank_by_gini", 0),
                     row["feature_id"],
                     row["feature_name"],
                     row["acfg_rds"],
@@ -2783,6 +3229,15 @@ def parse_cli_args(argv):
         choices=["directed", "undirected"],
         default="directed",
         help="CFG adjacency mode for Moran's I. Default: directed.",
+    )
+    parser.add_argument(
+        "--random-feature-seed",
+        type=lambda s: int(s, 0),
+        default=0xFA1C4,
+        help=(
+            "Base seed for the deterministic random6 feature baseline. "
+            "Accepts decimal (e.g. 1024452) or 0x-prefixed hex (e.g. 0xfa1c4)."
+        ),
     )
 
     # ---- Sancov-site Voronoi aggregation flags (Decision 9 / 3 / 10) ----
@@ -3222,7 +3677,11 @@ def run_extraction(args):
         aggregation_mode=args.sancov_agg_mode,
     )
 
-    stats_path = top4_path = top6_path = None
+    stats_path = None
+    top4_mask_path = None
+    top6_abs_mask_path = None
+    top6_gini_mask_path = None
+    random6_mask_path = None
     if not args.no_acfg_stats:
         print("[+] Computing ACFG-RDS statistics over full target ACFG ...")
         stats_unranked, ranked_stats = compute_acfg_feature_statistics(
@@ -3247,14 +3706,20 @@ def run_extraction(args):
             "unassigned_nodes": len(unassigned_nodes),
             "unassigned_node_ratio": finite_or_zero(unassigned_ratio),
         }
-        stats_path, top4_path, top6_path, _t4, _t6 = save_acfg_statistics_json(
+        stats_result = save_acfg_statistics_json(
             out_dir, base, target_name, schema_features, ranked_stats,
             n_nodes, n_edges,
             signal_source=args.acfg_stats_signal,
             edge_mode=args.acfg_edge_mode,
             eps=args.acfg_stats_eps,
             runtime_map_meta=runtime_map_meta,
+            random_feature_seed=args.random_feature_seed,
         )
+        stats_path = stats_result["stats_path"]
+        top4_mask_path = stats_result["top4_mask_path"]
+        top6_abs_mask_path = stats_result["top6_abs_acfg_rds_mask_path"]
+        top6_gini_mask_path = stats_result["top6_gini_mask_path"]
+        random6_mask_path = stats_result["random6_mask_path"]
         if VERBOSE:
             save_acfg_feature_ranking_debug(out_dir, base, ranked_stats)
     else:
@@ -3279,9 +3744,12 @@ def run_extraction(args):
     print(f"    ACFG           : {acfg_path}")
     print(f"    ACFG Voronoi   : {voronoi_path}")
     if stats_path:
-        print(f"    Statistics     : {stats_path}")
-        print(f"    Top4 mask      : {top4_path}")
-        print(f"    Top6 mask      : {top6_path}")
+        print(f"    Statistics            : {stats_path}")
+        print(f"    Top4 mask             : {top4_mask_path}")
+        print(f"    Top6 abs_acfg_rds mask: {top6_abs_mask_path}")
+        print(f"    Top6 gini mask        : {top6_gini_mask_path}")
+        print(f"    Random6 mask          : {random6_mask_path}")
+        print(f"    Random6 base seed     : 0x{int(args.random_feature_seed):x}")
     print(f"    Schema         : {schema_path}")
     print(f"    Runtime schema : {runtime_schema_path}")
     print(f"    APageRank      : {'enabled' if USE_APAGERANK else 'disabled'}")
