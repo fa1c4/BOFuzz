@@ -832,6 +832,16 @@ def run_apagerank(CFG, blocks, attr_names,
 
 # ======================= SANCOV PC-TABLE =======================
 def collect_pcs_aligned_with_counters():
+    """Parse the libFuzzer pc-table into a list aligned with __sancov_cntrs.
+
+    The pc-table is a fixed-stride array of ``(pc, flags)`` pairs (16 bytes
+    each on 64-bit), one entry per counter byte. The list this function
+    returns has length ``len(__sancov_cntrs)`` and is indexed by sancov
+    index. Any PC slot that cannot be parsed (e.g. IDA truncates the
+    segment or a PC sits in an unexpected section such as ``.text.startup``)
+    is recorded as ``0`` so downstream code sees an unmapped sancov site
+    instead of dropping the index and shifting the whole array.
+    """
     pcs_start, pcs_end = get_seg_bounds('__sancov_pcs')
     cnt_start, cnt_end = get_seg_bounds('__sancov_cntrs')
     if pcs_start is None or cnt_start is None:
@@ -843,15 +853,27 @@ def collect_pcs_aligned_with_counters():
 
     pcs = []
     ea = pcs_start
-    while ea + 8 <= pcs_end and len(pcs) < target_count:
+    # Fixed 16-byte stride is the canonical pc-table layout. The previous
+    # variable-stride heuristic produced off-by-N truncation when IDA's
+    # reported segment was 8 bytes short of the real section size, or when
+    # one of the PCs lived in e.g. ``.text.startup``.
+    while ea + 16 <= pcs_end and len(pcs) < target_count:
         q = read_qword_safe(ea)
-        if is_plausible_code_addr(q):
-            pcs.append(q)
-            ea += 16
-        else:
-            ea += 8
+        pcs.append(q if q is not None else 0)
+        ea += 16
+
     if len(pcs) < target_count:
-        log.warning(f"Only parsed {len(pcs)} PCs from __sancov_pcs, fewer than counters={target_count}; truncating to the smaller count")
+        log.warning(
+            f"Only parsed {len(pcs)} PCs from __sancov_pcs, fewer than counters={target_count}; "
+            f"padding remaining slots with 0 to keep sancov-index alignment"
+        )
+        while len(pcs) < target_count:
+            pcs.append(0)
+    elif len(pcs) > target_count:
+        log.warning(
+            f"Parsed {len(pcs)} PCs from __sancov_pcs, more than counters={target_count}; truncating"
+        )
+
     return pcs[:target_count]
 
 # ======================= TARGET-ONLY FUNCTION SET =======================
