@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "features": [
     {"id": "I00", "name": "bb_instruction_count", "group": "instruction"},
     {"id": "I01", "name": "numeric_immediate_count", "group": "instruction"},

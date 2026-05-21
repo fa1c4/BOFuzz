@@ -1,10 +1,9 @@
 use crate::feature_sched::metadata::{
-    FeatureSchemaFile, FeatureSpec, FeaturesMapMeta, FeaturesMatrixMeta,
+    FeatureSchemaFile, FeatureSpec, FeatureVectorMeta, FeaturesMapMeta, FeaturesMatrixMeta,
 };
 use crate::feature_sched::{
-    get_active_dim, get_active_feature_names, get_alpha_init, get_current_weight_vec,
-    get_factor_params, get_v_candidates, replace_v_candidates, set_current_weight_vec,
-    set_tpe_satisfied,
+    get_active_dim, get_active_feature_names, get_v_candidates, replace_v_candidates,
+    set_current_weight_vec, set_tpe_satisfied,
 };
 use libafl::common::HasMetadata;
 use libafl::Error;
@@ -14,6 +13,8 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
 };
+
+pub const EPS: f64 = 1e-6;
 
 const LEGACY_KEYS: &[&str] = &[
     "imme", "strc", "mem", "arith", "indeg", "offsp", "btw", "depth",
@@ -43,9 +44,9 @@ pub fn load_and_validate_schema(path: &Path) -> Result<FeatureSchemaFile, String
         )
     })?;
 
-    if schema.schema_version != 3 {
+    if schema.schema_version != 4 {
         return Err(format!(
-            "BOFuzz feature schema error: schema_version must be 3, got {}",
+            "BOFuzz feature schema error: schema_version must be 4, got {}",
             schema.schema_version
         ));
     }
@@ -272,6 +273,18 @@ pub fn load_and_validate_feature_map(
                     spec.id, spec.name, i
                 ));
             }
+            if v < 0.0 {
+                return Err(format!(
+                    "BOFuzz feature-map error: feature {} {} contains negative value at index {} under simplex mode",
+                    spec.id, spec.name, i
+                ));
+            }
+            if v > 1.0 + EPS {
+                return Err(format!(
+                    "BOFuzz feature-map error: feature {} {} value at index {} exceeds [0,1]",
+                    spec.id, spec.name, i
+                ));
+            }
         }
 
         match expected_len {
@@ -304,20 +317,37 @@ pub fn load_and_validate_feature_map(
     Ok(result)
 }
 
-fn one_hot(d: usize, idx: usize) -> Vec<f64> {
-    let mut v = vec![0.0; d];
-    if idx < d {
-        v[idx] = 1.0;
-    }
-    v
-}
-
-fn uniform_vec(d: usize) -> Vec<f64> {
+fn equal_simplex(d: usize) -> Vec<f64> {
     if d == 0 {
         return Vec::new();
     }
-    let v = 1.0f64 / (d as f64).sqrt();
-    vec![v; d]
+    vec![1.0 / d as f64; d]
+}
+
+pub fn normalize_simplex_eps(v: &[f64]) -> Result<Vec<f64>, String> {
+    if v.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sum = 0.0;
+    let mut out = Vec::with_capacity(v.len());
+    for &x in v {
+        if !x.is_finite() {
+            return Err("BOFuzz vector error: non-finite simplex weight".to_string());
+        }
+        if x < 0.0 {
+            return Err("BOFuzz vector error: negative simplex weight".to_string());
+        }
+        let y = x + EPS;
+        sum += y;
+        out.push(y);
+    }
+    if !sum.is_finite() || sum <= EPS {
+        return Err("BOFuzz vector error: simplex denominator is zero".to_string());
+    }
+    for x in &mut out {
+        *x /= sum;
+    }
+    Ok(out)
 }
 
 fn derive_dir_and_target(p: &Path) -> Option<(PathBuf, String)> {
@@ -331,6 +361,11 @@ fn derive_dir_and_target(p: &Path) -> Option<(PathBuf, String)> {
         let stem = p.file_stem()?.to_string_lossy().to_string();
         Some((dir, stem))
     }
+}
+
+fn candidate_format_error() -> String {
+    "error: BOFuzz _v_candidates.json format changed.\nexpected weights-only vector length active_dim.\nold [alpha, weights...] format is no longer supported."
+        .to_string()
 }
 
 fn load_candidates_from(path: &Path, active_dim: usize) -> Result<Vec<Vec<f64>>, String> {
@@ -364,14 +399,14 @@ fn load_candidates_from(path: &Path, active_dim: usize) -> Result<Vec<Vec<f64>>,
         ));
     }
 
-    let expected_len = 1 + active_dim;
+    let mut out = Vec::with_capacity(arr.len());
     for (i, cand) in arr.iter().enumerate() {
-        if cand.len() != expected_len {
+        if cand.len() != active_dim {
             return Err(format!(
-                "BOFuzz candidate error: candidate {} length {} != expected {} (1 + active_dim={})",
+                "{} candidate {} length {} != active_dim {}",
+                candidate_format_error(),
                 i,
                 cand.len(),
-                expected_len,
                 active_dim
             ));
         }
@@ -382,41 +417,20 @@ fn load_candidates_from(path: &Path, active_dim: usize) -> Result<Vec<Vec<f64>>,
                     i, j
                 ));
             }
+            if v < 0.0 {
+                return Err(format!(
+                    "BOFuzz candidate error: candidate {} contains negative value at index {}",
+                    i, j
+                ));
+            }
         }
-        let weights = &cand[1..];
-        let norm = weights.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm == 0.0 {
-            return Err(format!(
-                "BOFuzz candidate error: candidate {} active weights have zero norm",
-                i
-            ));
-        }
+        out.push(normalize_simplex_eps(cand)?);
     }
 
-    Ok(arr)
+    Ok(out)
 }
 
-fn generate_default_candidates(active_dim: usize, alpha: f64) -> Vec<Vec<f64>> {
-    let mut res = Vec::with_capacity(active_dim + 1);
-
-    // candidate 0: uniform active vector
-    let mut uniform = Vec::with_capacity(1 + active_dim);
-    uniform.push(alpha);
-    uniform.extend(uniform_vec(active_dim));
-    res.push(uniform);
-
-    // candidates 1..N: one-hot in active schema order
-    for i in 0..active_dim {
-        let mut v = Vec::with_capacity(1 + active_dim);
-        v.push(alpha);
-        v.extend(one_hot(active_dim, i));
-        res.push(v);
-    }
-
-    res
-}
-
-/// Load or generate candidate vectors. Candidate file absent -> defaults.
+/// Load user-provided candidate vectors. Candidate file absent -> empty pool.
 /// Candidate file present but invalid -> fatal error (returns Err).
 pub fn ensure_v_candidates_for<S: HasMetadata>(
     state: &mut S,
@@ -427,14 +441,10 @@ pub fn ensure_v_candidates_for<S: HasMetadata>(
         return Ok(());
     }
 
-    let alpha0 = get_alpha_init(state);
-    let alpha = if alpha0.is_finite() { alpha0 } else { 0.5 }.clamp(0.0, 1.0);
-
     let cands = match derive_dir_and_target(features_map_path) {
         Some((dir, tgt)) => {
             let cand_path = dir.join(format!("{}_v_candidates.json", tgt));
             if cand_path.exists() {
-                // File exists -> must be valid, fatal on error
                 let file_cands = load_candidates_from(&cand_path, active_dim).map_err(|e| {
                     format!(
                         "BOFuzz candidate error: invalid {}: {}",
@@ -443,39 +453,27 @@ pub fn ensure_v_candidates_for<S: HasMetadata>(
                     )
                 })?;
                 eprintln!(
-                    "[BOFuzz] Reading v candidates file: {}",
+                    "[BOFuzz] Reading simplex v candidates file: {}",
                     cand_path.display()
                 );
                 file_cands
             } else {
                 eprintln!(
-                    "[BOFuzz] No v-candidates file at {}, generating defaults.",
+                    "[BOFuzz] No v-candidates file at {}; TPE will sample from explore credits.",
                     cand_path.display()
                 );
-                generate_default_candidates(active_dim, alpha)
+                Vec::new()
             }
         }
         None => {
-            eprintln!("[BOFuzz] Cannot derive v-candidates path, generating defaults.");
-            generate_default_candidates(active_dim, alpha)
+            eprintln!(
+                "[BOFuzz] Cannot derive v-candidates path; TPE will sample from explore credits."
+            );
+            Vec::new()
         }
     };
 
     replace_v_candidates(state, cands);
-
-    let v0 = get_v_candidates(state)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| {
-            let mut v = vec![alpha];
-            v.extend(uniform_vec(active_dim));
-            v
-        });
-
-    if get_current_weight_vec(state).is_empty() {
-        set_current_weight_vec(state, v0);
-    }
-
     Ok(())
 }
 
@@ -490,7 +488,8 @@ pub fn combine_feature_matrix_to_weights(
     }
     let inv_sqrt_d = 1.0f64 / (d as f64).sqrt();
 
-    // Normalize the input weight vector
+    // BOFuzz externally uses a simplex vector. The historical dot/magnitude
+    // formula expects a direction vector, so normalize internally only here.
     let mut v = vec![0.0; d];
     let n = d.min(v_in.len());
     v[..n].copy_from_slice(&v_in[..n]);
@@ -500,7 +499,8 @@ pub fn combine_feature_matrix_to_weights(
             *w /= norm;
         }
     } else {
-        v = uniform_vec(d);
+        let u = 1.0f64 / (d as f64).sqrt();
+        v = vec![u; d];
     }
 
     let expected_len = map
@@ -519,7 +519,7 @@ pub fn combine_feature_matrix_to_weights(
         let mag = z.iter().map(|x| x * x).sum::<f64>().sqrt();
         let dot = z.iter().zip(v.iter()).map(|(a, b)| a * b).sum::<f64>();
         let w = (dot * inv_sqrt_d) * mag;
-        out.push(w);
+        out.push(if w.is_finite() { w.max(0.0) } else { 0.0 });
     }
     out
 }
@@ -550,22 +550,15 @@ pub fn load_and_align_features_map<S: HasMetadata>(
 
     let v0_active: Vec<f64> = get_v_candidates(state)
         .first()
-        .map(|v| v[1..].to_vec())
-        .unwrap_or_else(|| uniform_vec(active_dim));
+        .cloned()
+        .unwrap_or_else(|| equal_simplex(active_dim));
 
-    // Build active-only map from canonicalized full map
     let active_map = filter_active_features(canonical_map, active_feature_names);
-
     let feats = combine_feature_matrix_to_weights(&active_map, &v0_active, active_feature_names);
 
-    set_tpe_satisfied(state, true);
-    let alpha = get_factor_params(state).alpha;
-    let mut v_full = Vec::with_capacity(1 + v0_active.len());
-    v_full.push(alpha.clamp(0.0, 1.0));
-    v_full.extend_from_slice(&v0_active);
-    set_current_weight_vec(state, v_full);
+    set_tpe_satisfied(state, active_dim > 0);
+    set_current_weight_vec(state, Vec::new());
 
-    // Resize feats to match sites
     let mut aligned = feats;
     aligned.resize(sites, 0.0);
     aligned.truncate(sites);
@@ -573,43 +566,29 @@ pub fn load_and_align_features_map<S: HasMetadata>(
     Ok((aligned, active_map))
 }
 
-/// Apply a weight vector to recompute the features map. Strict validation:
-/// rejects wrong length, non-finite values, and zero-norm weights.
-pub fn apply_v_to_features<S: HasMetadata>(state: &mut S, v: &[f64]) -> Result<(), Error> {
+/// Apply a simplex feature-weight vector to recompute the scalar feature map.
+pub fn apply_v_to_features<S: HasMetadata>(
+    state: &mut S,
+    simplex_v: &[f64],
+    iteration: u64,
+) -> Result<(), Error> {
     let active_dim = get_active_dim(state);
     let active_names = get_active_feature_names(state);
 
-    if v.len() != active_dim {
+    if simplex_v.len() != active_dim {
         return Err(Error::illegal_argument(format!(
             "BOFuzz vector error: weight length {} != active_dim {}",
-            v.len(),
+            simplex_v.len(),
             active_dim
         )));
     }
 
-    if v.iter().any(|x| !x.is_finite()) {
-        return Err(Error::illegal_argument(
-            "BOFuzz vector error: non-finite active weight".to_string(),
-        ));
-    }
-
-    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-    if norm <= 0.0 {
-        return Err(Error::illegal_argument(
-            "BOFuzz vector error: active weights have zero norm".to_string(),
-        ));
-    }
-
-    // Normalize weights
-    let mut normalized = v.to_vec();
-    let inv = 1.0 / norm;
-    for w in normalized.iter_mut() {
-        *w *= inv;
-    }
+    let simplex_weights = normalize_simplex_eps(simplex_v).map_err(Error::illegal_argument)?;
 
     let (feats, sites) = match state.metadata_map().get::<FeaturesMatrixMeta>() {
         Some(m) => {
-            let feats = combine_feature_matrix_to_weights(&m.matrix, &normalized, &active_names);
+            let feats =
+                combine_feature_matrix_to_weights(&m.matrix, &simplex_weights, &active_names);
             (feats, m.sites)
         }
         None => {
@@ -637,11 +616,11 @@ pub fn apply_v_to_features<S: HasMetadata>(state: &mut S, v: &[f64]) -> Result<(
         state.add_metadata(FeaturesMapMeta { feats: aligned });
     }
 
-    let alpha = get_factor_params(state).alpha;
-    let mut v_full = Vec::with_capacity(1 + v.len());
-    v_full.push(alpha.clamp(0.0, 1.0));
-    v_full.extend(v);
-    set_current_weight_vec(state, v_full);
+    state.add_metadata(FeatureVectorMeta {
+        iteration,
+        simplex_weights: simplex_weights.clone(),
+    });
+    set_current_weight_vec(state, simplex_weights);
 
     Ok(())
 }

@@ -1,13 +1,15 @@
 /*
 features_sched/sancov_index_feedback.rs: update sancov indices
 */
-use crate::feature_sched::SancovIndexesMetadata;
+use crate::feature_sched::{
+    CoverageDeltaMeta, CoverageProgressMeta, FrontierMeta, SancovIndexesMetadata, TpeIterationMeta,
+};
 use libafl::{
     common::{HasMetadata, HasNamedMetadata},
     corpus::Testcase,
     events::{Event, EventFirer},
     executors::ExitKind,
-    feedbacks::{Feedback, StateInitializer},
+    feedbacks::{Feedback, MapFeedbackMetadata, StateInitializer},
     inputs::Input,
     monitors::{AggregatorOps, UserStats, UserStatsValue},
     observers::MapObserver,
@@ -25,6 +27,7 @@ where
     C: MapObserver<Entry = u8> + Named,
 {
     name: Cow<'static, str>,
+    edge_name: Cow<'static, str>,
     handle: Handle<C>,
     _p: core::marker::PhantomData<C>,
 }
@@ -36,6 +39,7 @@ where
     pub fn new(map: &C) -> Self {
         Self {
             name: map.name().clone(),
+            edge_name: Cow::Borrowed("edges"),
             handle: map.handle(),
             _p: core::marker::PhantomData,
         }
@@ -65,7 +69,7 @@ where
     I: Input,
     EM: EventFirer<I, S>,
     OT: MatchNameRef,
-    S: HasNamedMetadata,
+    S: HasNamedMetadata + HasMetadata,
     C: MapObserver<Entry = u8> + Named + for<'it> AsIter<'it, Item = u8>,
 {
     fn is_interesting(
@@ -98,8 +102,44 @@ where
             }
         }
         if !idx.is_empty() {
-            testcase.add_metadata(SancovIndexesMetadata::new(idx));
+            testcase.add_metadata(SancovIndexesMetadata::new(idx.clone()));
         }
+
+        let current_covered_edges = state
+            .named_metadata_map()
+            .get::<MapFeedbackMetadata<u8>>(&self.edge_name)
+            .map(|m| m.num_covered_map_indexes as u64)
+            .unwrap_or(0);
+        let last_covered_edges = state
+            .metadata_map()
+            .get::<CoverageProgressMeta>()
+            .map(|m| m.last_covered_edges)
+            .unwrap_or(0);
+        let delta_edges = current_covered_edges.saturating_sub(last_covered_edges);
+        state.add_metadata(CoverageProgressMeta {
+            last_covered_edges: current_covered_edges,
+        });
+
+        let covered = state
+            .metadata_map()
+            .get::<FrontierMeta>()
+            .map(|m| m.covered.clone())
+            .unwrap_or_default();
+        let newly_covered_sancov = idx
+            .iter()
+            .copied()
+            .filter(|&i| !covered.get(i).copied().unwrap_or(false))
+            .collect::<Vec<_>>();
+        let iteration = state
+            .metadata_map()
+            .get::<TpeIterationMeta>()
+            .map(|m| m.current_iteration)
+            .unwrap_or(0);
+        state.add_metadata(CoverageDeltaMeta {
+            iteration,
+            delta_edges,
+            newly_covered_sancov,
+        });
 
         // [option: report coverage info]
         mgr.fire(

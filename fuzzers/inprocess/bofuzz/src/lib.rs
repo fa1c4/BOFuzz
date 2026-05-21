@@ -23,7 +23,6 @@ use libafl::{
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::{BytesInput, HasTargetBytes},
-    monitors::SimpleMonitor,
     mutators::{
         havoc_mutations, token_mutations::I2SRandReplace, tokens_mutations, StdMOptMutator,
         StdScheduledMutator, Tokens,
@@ -55,6 +54,7 @@ use libafl_targets::{
 };
 #[cfg(unix)]
 use nix::unistd::dup;
+use serde::Deserialize;
 
 mod feature_sched;
 use crate::feature_sched::{
@@ -62,10 +62,11 @@ use crate::feature_sched::{
         compute_active_features, load_and_align_features_map, load_and_validate_feature_map,
         load_and_validate_schema, parse_vec_mask,
     },
-    get_active_dim, get_active_feature_names, get_features_enabled, get_fuzz_start, set_alpha_init,
-    set_current_weight_vec, set_explore_time, set_factor_params, set_feat_exists, set_feat_mode,
-    set_fuzz_start, set_schema_info, set_tpe_period, set_tpe_satisfied, FactorParams,
-    FeaturesAccountingStage, FeaturesMapMeta, FeaturesMatrixMeta, SancovIndexFeedback,
+    get_features_enabled, get_fuzz_start, set_alpha_init, set_explore_time, set_factor_params,
+    set_feat_exists, set_feat_mode, set_fuzz_start, set_schema_info, set_tpe_period, FactorParams,
+    FeaturesAccountingStage, FeaturesMapMeta, FeaturesMatrixMeta, FrontierCreditFeedback,
+    SancovAcfgMeta, SancovIndexFeedback, TpeIterationMeta, WeightComputeMode,
+    WeightComputeModeMeta,
 };
 mod custom_monitor;
 use crate::custom_monitor::CustomMonitor;
@@ -86,21 +87,13 @@ struct BofuzzArgs {
     feat_mode: u8,
     explore_time_secs: u64,
     tpe_period_secs: u64,
-    alpha_explicit: bool,
-}
-
-fn fmt_vec_short(v: &[f64], maxn: usize) -> String {
-    let n = v.len();
-    let take = n.min(maxn);
-    let mut s = v[..take]
-        .iter()
-        .map(|x| format!("{:.3}", x))
-        .collect::<Vec<_>>()
-        .join(",");
-    if n > take {
-        s.push_str(",...");
-    }
-    format!("[{}] (len={})", s, n)
+    weight_compute_mode: WeightComputeMode,
+    tpe_samples: usize,
+    tpe_gamma: f64,
+    tpe_bw: f64,
+    trials_threshold: usize,
+    re_tpe_threshold_secs: u64,
+    sancov_acfg_path: Option<PathBuf>,
 }
 
 fn resolve_bofuzz_root() -> Option<PathBuf> {
@@ -127,6 +120,97 @@ fn resolve_bofuzz_root() -> Option<PathBuf> {
 fn default_schema_path() -> Option<PathBuf> {
     let root = resolve_bofuzz_root()?;
     Some(root.join("static_analysis/features_schema.json"))
+}
+
+fn default_sancov_acfg_path_from_current_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let stem = exe.file_stem()?.to_string_lossy();
+    Some(exe_dir.join(format!("{}_sancov_acfg.json", stem)))
+}
+
+fn parse_weight_compute_mode(raw: &str) -> Result<WeightComputeMode, String> {
+    match raw {
+        "frontier" => Ok(WeightComputeMode::Frontier),
+        "path" => Ok(WeightComputeMode::Path),
+        other => Err(format!(
+            "BOFuzz --weight-compute error: expected frontier|path, got {}",
+            other
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SancovAcfgFile {
+    schema_version: u64,
+    kind: String,
+    n_sancov_sites: usize,
+    successors: Vec<Vec<usize>>,
+    predecessors: Vec<Vec<usize>>,
+}
+
+fn load_sancov_acfg(path: &Path, sancov_sites: usize) -> Result<SancovAcfgMeta, String> {
+    let mut f = File::open(path).map_err(|e| {
+        format!(
+            "BOFuzz sancov ACFG error: cannot open {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    let mut s = String::new();
+    f.read_to_string(&mut s).map_err(|e| {
+        format!(
+            "BOFuzz sancov ACFG error: cannot read {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    let file: SancovAcfgFile = serde_json::from_str(&s).map_err(|e| {
+        format!(
+            "BOFuzz sancov ACFG error: invalid JSON in {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    if file.schema_version != 1 || file.kind != "bofuzz-sancov-acfg-v1" {
+        return Err(format!(
+            "BOFuzz sancov ACFG error: {} has unsupported schema/kind",
+            path.display()
+        ));
+    }
+    if file.n_sancov_sites != sancov_sites {
+        return Err(format!(
+            "BOFuzz sancov ACFG error: n_sancov_sites {} != runtime sancov sites {}",
+            file.n_sancov_sites, sancov_sites
+        ));
+    }
+    if file.successors.len() != file.n_sancov_sites {
+        return Err("BOFuzz sancov ACFG error: successors length mismatch".to_string());
+    }
+    if file.predecessors.len() != file.n_sancov_sites {
+        return Err("BOFuzz sancov ACFG error: predecessors length mismatch".to_string());
+    }
+    for (kind, lists) in [
+        ("successors", &file.successors),
+        ("predecessors", &file.predecessors),
+    ] {
+        for (i, xs) in lists.iter().enumerate() {
+            for &node in xs {
+                if node >= file.n_sancov_sites {
+                    return Err(format!(
+                        "BOFuzz sancov ACFG error: {}[{}] contains out-of-range node {}",
+                        kind, i, node
+                    ));
+                }
+            }
+        }
+    }
+    Ok(SancovAcfgMeta {
+        iteration: 0,
+        n_sancov_sites: file.n_sancov_sites,
+        successors: file.successors,
+        predecessors: file.predecessors,
+    })
 }
 
 /// The fuzzer main (as `no_mangle` C function)
@@ -186,8 +270,8 @@ pub extern "C" fn libafl_main() {
         .arg(
             Arg::new("alpha")
                 .long("alpha")
-                .default_value("0.2")
-                .help("the <alpha> * features_factor")
+                .default_value("0.85")
+                .help("fixed feature factor blend alpha")
         )
         .arg(
             Arg::new("beta")
@@ -204,7 +288,7 @@ pub extern "C" fn libafl_main() {
         .arg(
             Arg::new("gmax")
                 .long("gmax")
-                .default_value("3.0")
+                .default_value("2.0")
                 .help("factor range: (gmin, <gmax>)")
         )
         .arg(
@@ -221,6 +305,13 @@ pub extern "C" fn libafl_main() {
                 .help("0: off, 1: weight scheduling only, 2: power scheduling only, 3: both")
         )
         .arg(
+            Arg::new("weight-compute")
+                .long("weight-compute")
+                .value_parser(["frontier", "path"])
+                .default_value("frontier")
+                .help("Feature corpus weight computation mode")
+        )
+        .arg(
             Arg::new("explore-time-secs")
                 .long("explore-time-secs")
                 .value_parser(clap::value_parser!(u64))
@@ -233,6 +324,46 @@ pub extern "C" fn libafl_main() {
                 .value_parser(clap::value_parser!(u64))
                 .default_value("600")
                 .help("TPE learning period per iteration, in seconds (default: 600 = 10 minutes)")
+        )
+        .arg(
+            Arg::new("tpe-samples")
+                .long("tpe-samples")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("16")
+                .help("Number of KDE samples for initial and inverse TPE candidate pools")
+        )
+        .arg(
+            Arg::new("tpe-gamma")
+                .long("tpe-gamma")
+                .value_parser(clap::value_parser!(f64))
+                .default_value("0.15")
+                .help("TPE good-set split ratio")
+        )
+        .arg(
+            Arg::new("tpe-bw")
+                .long("tpe-bw")
+                .value_parser(clap::value_parser!(f64))
+                .default_value("0.05")
+                .help("Logit-space KDE bandwidth")
+        )
+        .arg(
+            Arg::new("trials-threshold")
+                .long("trials-threshold")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("5")
+                .help("Positive-reward trials required before KDE TPE")
+        )
+        .arg(
+            Arg::new("re-tpe-threshold-secs")
+                .long("re-tpe-threshold-secs")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("3600")
+                .help("LockedBest no-new-edge interval before inverse re-TPE")
+        )
+        .arg(
+            Arg::new("sancov-acfg")
+                .long("sancov-acfg")
+                .help("Path to {target}_sancov_acfg.json")
         )
         .arg(Arg::new("remaining"))
         .try_get_matches()
@@ -347,7 +478,6 @@ pub extern "C" fn libafl_main() {
     // --- Step 4: Compute active features ---
     let active_features = compute_active_features(&schema, &vec_mask);
     let active_dim = active_features.len();
-    let active_names: Vec<String> = active_features.iter().map(|f| f.name.clone()).collect();
     let mask_str: String = vec_mask
         .iter()
         .map(|&b| if b { '1' } else { '0' })
@@ -367,7 +497,15 @@ pub extern "C" fn libafl_main() {
     );
 
     let cli_features_path = res.get_one::<String>("features").map(PathBuf::from);
-    let alpha_explicit = res.value_source("alpha") == Some(clap::parser::ValueSource::CommandLine);
+    let weight_compute_mode = match parse_weight_compute_mode(
+        res.get_one::<String>("weight-compute").unwrap().as_str(),
+    ) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    };
     let params = FactorParams {
         alpha: res.get_one::<String>("alpha").unwrap().parse().unwrap(),
         beta: res.get_one::<String>("beta").unwrap().parse().unwrap(),
@@ -381,7 +519,13 @@ pub extern "C" fn libafl_main() {
         feat_mode: *res.get_one::<u8>("feat-mode").unwrap(),
         explore_time_secs: *res.get_one::<u64>("explore-time-secs").unwrap(),
         tpe_period_secs: *res.get_one::<u64>("tpe-period-secs").unwrap(),
-        alpha_explicit,
+        weight_compute_mode,
+        tpe_samples: *res.get_one::<usize>("tpe-samples").unwrap(),
+        tpe_gamma: *res.get_one::<f64>("tpe-gamma").unwrap(),
+        tpe_bw: *res.get_one::<f64>("tpe-bw").unwrap(),
+        trials_threshold: *res.get_one::<usize>("trials-threshold").unwrap(),
+        re_tpe_threshold_secs: *res.get_one::<u64>("re-tpe-threshold-secs").unwrap(),
+        sancov_acfg_path: res.get_one::<String>("sancov-acfg").map(PathBuf::from),
     };
 
     fuzz(
@@ -506,13 +650,15 @@ fn fuzz(
 
     let map_feedback = MaxMapFeedback::new(&edges_observer);
     let sancov_idx_fb = SancovIndexFeedback::new(&sancov_observer);
+    let frontier_credit_fb = FrontierCreditFeedback::new();
 
     let calibration = CalibrationStage::new(&map_feedback);
 
     let mut feedback = feedback_or!(
         map_feedback,
         TimeFeedback::new(&time_observer),
-        sancov_idx_fb
+        sancov_idx_fb,
+        frontier_credit_fb
     );
 
     let mut objective = CrashFeedback::new();
@@ -569,7 +715,7 @@ fn fuzz(
     // 4. Validate feature map against schema if present
     let mut pending_feats: Option<Vec<f64>> = None;
     let mut pending_matrix: Option<std::collections::HashMap<String, Vec<f64>>> = None;
-    let mut has_feats = false;
+    let has_feats;
 
     if let Some(p) = chosen_path.as_ref() {
         // Validate and canonicalize the feature map in one pass
@@ -603,7 +749,7 @@ fn fuzz(
             }
         }
     } else {
-        eprintln!("[BOFuzz] no features map provided/found. Falling back to cold fuzzing.");
+        eprintln!("warning: BOFuzz features_map not found; feature scheduling disabled, continue cold fuzzing.");
         has_feats = false;
     }
 
@@ -623,18 +769,34 @@ fn fuzz(
         });
     }
     set_feat_exists(&mut state, has_feats);
+    state.add_metadata(WeightComputeModeMeta {
+        mode: bofuzz_args.weight_compute_mode,
+    });
+    if state.metadata_map().get::<TpeIterationMeta>().is_none() {
+        state.add_metadata(TpeIterationMeta::default());
+    }
 
-    // Alpha precedence: explicit CLI alpha > candidate alpha > default
-    if !bofuzz_args.alpha_explicit {
-        use crate::feature_sched::get_current_weight_vec;
-        let cur_v = get_current_weight_vec(&state);
-        if !cur_v.is_empty() {
-            let candidate_alpha = cur_v[0];
-            if candidate_alpha.is_finite() && candidate_alpha >= 0.0 && candidate_alpha <= 1.0 {
-                let mut params = bofuzz_args.factor_params.clone();
-                params.alpha = candidate_alpha;
-                set_factor_params(&mut state, params);
-                set_alpha_init(&mut state, candidate_alpha);
+    if has_feats
+        && bofuzz_args.feat_mode != 0
+        && bofuzz_args.weight_compute_mode == WeightComputeMode::Frontier
+    {
+        let acfg_path = bofuzz_args
+            .sancov_acfg_path
+            .clone()
+            .or_else(default_sancov_acfg_path_from_current_exe)
+            .ok_or_else(|| {
+                Error::illegal_argument(
+                    "BOFuzz sancov ACFG error: cannot derive default path".to_string(),
+                )
+            })?;
+        match load_sancov_acfg(&acfg_path, sancov_sites) {
+            Ok(meta) => {
+                eprintln!("[BOFuzz] using sancov ACFG: {}", acfg_path.display());
+                state.add_metadata(meta);
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
             }
         }
     }
@@ -744,12 +906,13 @@ fn fuzz(
     let tpe_stage = {
         let mut p = TpeParams::default();
         p.period = Duration::from_secs(get_tpe_period(&state));
+        p.samples = bofuzz_args.tpe_samples;
+        p.gamma = bofuzz_args.tpe_gamma;
+        p.bw = bofuzz_args.tpe_bw;
+        p.trials_threshold = bofuzz_args.trials_threshold;
+        p.re_tpe_threshold = Duration::from_secs(bofuzz_args.re_tpe_threshold_secs);
         TpeStage::new(p, edges_name.clone())
     };
-    {
-        let cur_corpus = state.corpus().count();
-        tpe_stage.opt.set_last_corpus(cur_corpus);
-    }
 
     let mut stages = tuple_list!(calibration, tracing, feat_stage, i2s, power, tpe_stage);
 

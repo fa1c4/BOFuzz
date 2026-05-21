@@ -14,8 +14,8 @@ use crate::{
     Error, HasMetadata,
 };
 // for libfun metadata usage
-use serde::{Deserialize, Serialize};
 use libafl_bolts::SerdeAny;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
 pub struct ExternalPerfMultMeta(pub f64);
@@ -281,7 +281,7 @@ where
             perf_score = HAVOC_MAX_MULT * 100.0;
         }
 
-        // [allow exceed upper bound] libfun features factor 
+        // [allow exceed upper bound] libfun features factor
         if matches!(get_feat_mode_from_state(state), 2 | 3) {
             if let Some(mult) = entry.metadata_map().get::<ExternalPerfMultMeta>() {
                 let m = mult.0;
@@ -378,7 +378,7 @@ where
             weight *= 0.00;
         }
 
-        // libfun features on weight 
+        // libfun features on weight
         if matches!(get_feat_mode_from_state(state), 1 | 3) {
             if let Some(mult) = entry.metadata_map().get::<ExternalPerfMultMeta>() {
                 let m = mult.0;

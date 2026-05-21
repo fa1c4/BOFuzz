@@ -3,7 +3,7 @@
 Build {binary}_features_map.json aligned to sancov pc-table,
 USING ONLY the target-binary-exclusive CFG/CG (reachable from LLVMFuzzerTestOneInput).
 
-Canonical 16-feature basic-block static extractor (schema v3).
+Canonical 16-feature basic-block static extractor (schema v4).
 
 No external deps. Designed for IDA Pro. Supports two execution modes:
 
@@ -121,8 +121,9 @@ log = logging.getLogger("target_features_map")
 if not log.handlers:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-# ---- Schema v3: canonical 16-dim feature set ----
-FEATURE_SCHEMA_VERSION = 3
+# ---- Schema v4: canonical 16-dim non-negative feature set ----
+FEATURE_SCHEMA_VERSION = 4
+NORMALIZATION_EPS = 1e-6
 
 ATTR_NAMES = [
     # Instruction-level BB features
@@ -147,14 +148,6 @@ ATTR_NAMES = [
 
 INSTRUCTION_ATTRS = ATTR_NAMES[:8]
 STRUCTURAL_ATTRS = ATTR_NAMES[8:]
-
-# ---- APageRank (disabled by default) ----
-USE_APAGERANK = False
-APAGERANK_DAMPING = 0.85
-APAGERANK_GAMMA = 1.0
-APAGERANK_TAU = 1.0
-APAGERANK_EPSILON = 0.01
-APAGERANK_ITER_MAX = 5
 
 # ---- Centrality ----
 CENTRALITY_EXACT_MAX = 3000
@@ -186,13 +179,6 @@ STRING_SEGMENT_NAMES = {
 }
 
 # ---- Normalization groups ----
-LOG1P_FEATURES = {
-    "static_descendant_count",
-    "static_ancestor_count",
-    "entry_depth",
-    "centrality",
-}
-
 RAW_BINARY_FEATURES = {
     "loop_boundary_flag",
 }
@@ -715,120 +701,60 @@ class BBCache(object):
         return None
 
 # ======================= NORMALIZATION =======================
-def _mean_std(xs):
-    n = float(len(xs))
-    if n == 0:
-        return 0.0, 1.0
-    mu = sum(xs) / n
-    var = sum((x - mu) ** 2 for x in xs) / n
-    sd = math.sqrt(var)
-    return mu, sd
+def normalization_metadata():
+    return {
+        "default": "nonnegative_log1p_minmax_v1",
+        "range": "[0, 1]",
+        "eps": NORMALIZATION_EPS,
+        "binary_features": sorted(RAW_BINARY_FEATURES),
+        "apagerank": "removed",
+        "voronoi_aggregation": "sum",
+    }
+
+
+def _normalize_nonnegative_log1p_minmax_feature(name, raw_values):
+    xs = [max(0.0, finite_or_zero(x)) for x in raw_values]
+
+    if name in RAW_BINARY_FEATURES:
+        return [1.0 if x > 0.0 else 0.0 for x in xs]
+
+    ts = [math.log1p(x) for x in xs]
+    if not ts:
+        return []
+
+    lo = min(ts)
+    hi = max(ts)
+    span = hi - lo
+    if span <= NORMALIZATION_EPS:
+        return [0.0 for _ in ts]
+
+    out = []
+    for t in ts:
+        v = (t - lo) / span
+        v = min(1.0, max(0.0, finite_or_zero(v)))
+        out.append(v)
+    return out
+
 
 def normalize_blocks(blocks):
     if not blocks:
         return
+
     bblist = list(blocks.values())
+
     for name in ATTR_NAMES:
         raw_values = [b.get_raw_attr(name) for b in bblist]
+        norm_values = _normalize_nonnegative_log1p_minmax_feature(name, raw_values)
 
-        if name in LOG1P_FEATURES:
-            values = [math.log1p(max(0.0, x)) for x in raw_values]
-        else:
-            values = raw_values
-
-        if name in RAW_BINARY_FEATURES:
-            for b, v in zip(bblist, values):
-                b.set_norm_attr(name, finite_or_zero(float(v)))
-            continue
-
-        mu, sd = _mean_std(values)
-        if sd < 1e-12:
-            for b in bblist:
-                b.set_norm_attr(name, 0.0)
-        else:
-            for b, v in zip(bblist, values):
-                b.set_norm_attr(name, finite_or_zero((v - mu) / sd))
-
-# ======================= APAGERANK =======================
-def run_apagerank(CFG, blocks, attr_names,
-                  damping=APAGERANK_DAMPING,
-                  gamma=APAGERANK_GAMMA,
-                  tau=APAGERANK_TAU,
-                  epsilon=APAGERANK_EPSILON,
-                  iter_max=APAGERANK_ITER_MAX):
-    if not blocks:
-        return
-
-    nodes = list(blocks.keys())
-
-    preds = defaultdict(set)
-    indeg = defaultdict(int)
-    outdeg = defaultdict(int)
-
-    for u, outs in CFG.items():
-        if u not in blocks:
-            continue
-        outs_filtered = [v for v in outs if v in blocks]
-        outdeg[u] = len(outs_filtered)
-        for v in outs_filtered:
-            preds[v].add(u)
-            indeg[v] += 1
-
-    for n in nodes:
-        _ = indeg[n]
-        _ = outdeg[n]
-        _ = preds[n]
-
-    for attr in attr_names:
-        w_prev = {}
-        for n in nodes:
-            w_prev[n] = float(blocks[n].get_norm_attr(attr))
-
-        if not w_prev:
-            continue
-
-        if VERBOSE:
-            print(f"[+] APageRank: attr '{attr}' start, "
-                  f"iters <= {iter_max}, eps={epsilon}")
-
-        for it in range(iter_max):
-            w_next = {}
-            max_delta = 0.0
-
-            for x in nodes:
-                old_val = w_prev[x]
-                acc = 0.0
-                for y in preds[x]:
-                    wy = w_prev[y]
-                    Oy = outdeg.get(y, 0)
-                    if Oy <= 0:
-                        continue
-                    denom = float(Oy) * pow(float(indeg.get(x, 0)) + tau, gamma)
-                    if denom != 0.0:
-                        acc += wy / denom
-                new_val = (1.0 - damping) * old_val + damping * acc
-                w_next[x] = new_val
-
-            for n in nodes:
-                delta = abs(w_next[n] - w_prev[n])
-                if delta > max_delta:
-                    max_delta = delta
-
-            w_prev = w_next
-
-            if VERBOSE:
-                print(f"    iter {it+1}: max_delta={max_delta:.6f}")
-
-            if max_delta < epsilon:
-                if VERBOSE:
-                    print(f"[+] APageRank: attr '{attr}' converged at iter {it+1}")
-                break
-        else:
-            if VERBOSE:
-                print(f"[+] APageRank: attr '{attr}' reached iter_max={iter_max}")
-
-        for n, val in w_prev.items():
-            blocks[n].set_norm_attr(attr, val)
+        for b, v in zip(bblist, norm_values):
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise RuntimeError(f"non-finite normalized feature: {name}={v}")
+            if fv < 0.0:
+                raise RuntimeError(f"negative normalized feature forbidden: {name}={v}")
+            if fv > 1.0 + NORMALIZATION_EPS:
+                raise RuntimeError(f"normalized feature exceeds [0,1]: {name}={v}")
+            b.set_norm_attr(name, fv)
 
 # ======================= SANCOV PC-TABLE =======================
 def collect_pcs_aligned_with_counters():
@@ -1960,29 +1886,21 @@ def build_acfg_voronoi_regions(node_count, seeds, voronoi_adj):
     return dict(regions_by_sancov), node_assignment, unassigned
 
 
-def aggregate_voronoi_region(values_by_node, region_nodes, node_assignment, gamma):
-    """Weighted-mean aggregation over one Voronoi region.
+def aggregate_voronoi_region(values_by_node, region_nodes, node_assignment=None, gamma=None):
+    """Sum aggregation over one Voronoi region.
 
-    ``agg = sum_v gamma^dist(s,v) * x_v  /  sum_v gamma^dist(s,v)``
-
-    Falls back to 0 on empty or degenerate weight sums (the seed itself
-    is always at distance 0 with weight 1 if it is in the region).
+    Block-level values are already normalized into ``[0, 1]``. The sum rewards
+    larger regions; callers re-normalize the sancov-level arrays afterward.
     """
     if not region_nodes:
         return 0.0
-    num = 0.0
-    den = 0.0
+    total = 0.0
     for node_idx in region_nodes:
-        info = node_assignment.get(node_idx)
-        if info is None:
-            continue
-        w = gamma ** info["distance"]
-        v = finite_or_zero(values_by_node.get(node_idx, 0.0))
-        num += w * v
-        den += w
-    if den <= 0.0:
-        return 0.0
-    return finite_or_zero(num / den)
+        v = max(0.0, finite_or_zero(values_by_node.get(node_idx, 0.0)))
+        total += v
+    if not math.isfinite(total) or total < 0.0:
+        raise RuntimeError(f"invalid Voronoi sum aggregation value: {total}")
+    return total
 
 
 def build_voronoi_runtime_feature_arrays(blocks, node_order, schema_features,
@@ -2030,7 +1948,9 @@ def build_voronoi_runtime_feature_arrays(blocks, node_order, schema_features,
             arr.append(aggregate_voronoi_region(
                 values_by_node, region, node_assignment, gamma,
             ))
-        feature_arrays[feature_name] = arr
+        feature_arrays[feature_name] = _normalize_nonnegative_log1p_minmax_feature(
+            feature_name, arr,
+        )
 
     return feature_arrays
 
@@ -2133,6 +2053,72 @@ def save_acfg_voronoi_json(out_dir, base, target_name, seeds,
         json.dump(payload, f, indent=2)
     if VERBOSE:
         print(f"[+] Saved ACFG Voronoi -> {out_path}")
+    return out_path
+
+
+def save_sancov_acfg_json(out_dir, base, target_name, sancov_seeds,
+                           regions_by_sancov, node_assignment, acfg_adj):
+    # Emit <base>_sancov_acfg.json for runtime frontier computation.
+    n_sancov = len(sancov_seeds)
+    successors = [set() for _ in range(n_sancov)]
+    predecessors = [set() for _ in range(n_sancov)]
+
+    def owner_sancov(node_idx):
+        info = node_assignment.get(node_idx)
+        if info is None:
+            return None
+        owner = info.get("owner")
+        if owner is None or not (0 <= int(owner) < n_sancov):
+            return None
+        return int(owner)
+
+    for u, vs in acfg_adj.items():
+        su = owner_sancov(u)
+        if su is None:
+            continue
+        for v in vs:
+            sv = owner_sancov(v)
+            if sv is None or sv == su:
+                continue
+            successors[su].add(sv)
+            predecessors[sv].add(su)
+
+    seed_by_index = {seed["sancov_index"]: seed for seed in sancov_seeds}
+    nodes = []
+    for sancov_index in range(n_sancov):
+        seed = seed_by_index.get(sancov_index)
+        if seed is None:
+            continue
+        node = seed.get("node_index")
+        if node is None:
+            continue
+        nodes.append({
+            "sancov_index": sancov_index,
+            "pc": seed.get("pc"),
+            "seed_node": node,
+            "region_size": len(regions_by_sancov.get(sancov_index, [])),
+        })
+
+    payload = {
+        "schema_version": 1,
+        "kind": "bofuzz-sancov-acfg-v1",
+        "target": target_name,
+        "n_sancov_sites": n_sancov,
+        "nodes": nodes,
+        "successors": [sorted(vs) for vs in successors],
+        "predecessors": [sorted(vs) for vs in predecessors],
+    }
+
+    if len(payload["successors"]) != n_sancov:
+        raise RuntimeError("sancov ACFG successors length mismatch")
+    if len(payload["predecessors"]) != n_sancov:
+        raise RuntimeError("sancov ACFG predecessors length mismatch")
+
+    out_path = os.path.join(out_dir, f"{base}_sancov_acfg.json")
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    if VERBOSE:
+        print(f"[+] Saved sancov ACFG -> {out_path}")
     return out_path
 
 
@@ -2518,9 +2504,9 @@ def run_acfg_self_tests():
     check("duplicate seed mapping raises RuntimeError", raised,
           "no exception raised")
 
-    print("[self-test] Voronoi weighted aggregation gamma=0.5")
+    print("[self-test] Voronoi sum aggregation")
     # seed=0, region={0:dist 0, 1:dist 1}, values={0:10, 1:20}
-    # expected: (1.0*10 + 0.5*20)/(1.0+0.5) = 20/1.5 = 13.333...
+    # expected: 10 + 20 = 30
     values_by_node = {0: 10.0, 1: 20.0}
     region_nodes = [0, 1]
     node_assign_test = {
@@ -2530,8 +2516,8 @@ def run_acfg_self_tests():
     agg = aggregate_voronoi_region(
         values_by_node, region_nodes, node_assign_test, gamma=0.5,
     )
-    check("aggregate_voronoi_region matches closed-form 13.333...",
-          _approx(agg, 20.0 / 1.5, tol=1e-9), f"got {agg}")
+    check("aggregate_voronoi_region sums region values",
+          _approx(agg, 30.0, tol=1e-9), f"got {agg}")
 
     print("[self-test] empty region falls back to zero")
     agg_empty = aggregate_voronoi_region({}, [], {}, gamma=0.5)
@@ -2812,7 +2798,7 @@ def run_acfg_self_tests():
             tmp, "synthetic", "synthetic_target", schema16,
             ranked_synth, n_nodes=42, n_edges=87,
             signal_source="norm", edge_mode="directed", eps=1e-8,
-            runtime_map_meta={"mode": "voronoi-weighted-mean"},
+            runtime_map_meta={"mode": "sum"},
             random_feature_seed=0xFA1C4,
         )
         with open(result["stats_path"]) as fh:
@@ -3022,6 +3008,10 @@ def validate_features(pcs, CFG, blocks):
                 errors.append(f"BB {hex(bb_ea)}: raw {name} is {rv}")
             if math.isnan(nv) or math.isinf(nv):
                 errors.append(f"BB {hex(bb_ea)}: norm {name} is {nv}")
+            if nv < 0.0:
+                errors.append(f"BB {hex(bb_ea)}: norm {name} is negative: {nv}")
+            if nv > 1.0 + NORMALIZATION_EPS:
+                errors.append(f"BB {hex(bb_ea)}: norm {name} exceeds [0,1]: {nv}")
         lbf = b.get_raw_attr("loop_boundary_flag")
         if lbf not in (0.0, 1.0):
             errors.append(f"BB {hex(bb_ea)}: loop_boundary_flag is {lbf}")
@@ -3078,9 +3068,16 @@ def validate_exported_maps(attr_arrays, pcs):
                 % (name, len(arr), len(pcs))
             )
 
-        for x in arr:
-            if not math.isfinite(float(x)):
-                raise RuntimeError("non-finite value in feature array: %s" % name)
+        for i, x in enumerate(arr):
+            fv = float(x)
+            if not math.isfinite(fv):
+                raise RuntimeError(f"non-finite runtime feature: {name}[{i}]={x}")
+            if fv < 0.0:
+                raise RuntimeError(
+                    f"negative runtime feature forbidden under simplex mode: {name}[{i}]={x}"
+                )
+            if fv > 1.0 + NORMALIZATION_EPS:
+                raise RuntimeError(f"runtime feature exceeds [0,1]: {name}[{i}]={x}")
 
 # ======================= EXPORT =======================
 def _cross_platform_basename(path):
@@ -3144,11 +3141,7 @@ def save_schema_json(out_dir, base, execution=None, out_dir_override=None):
             "instruction": INSTRUCTION_ATTRS,
             "structural": STRUCTURAL_ATTRS,
         },
-        "normalization": {
-            "default": "zscore(raw)",
-            "log1p_features": sorted(LOG1P_FEATURES),
-            "raw_binary_features": sorted(RAW_BINARY_FEATURES),
-        },
+        "normalization": normalization_metadata(),
         "target_scope": "functions reachable from LLVMFuzzerTestOneInput",
         "architecture_support": "x86/x86_64 first-class",
         "zero_policy": "target BB zeros are preserved; EPS_NON_TARGET is used only for no_bb and non_target",
@@ -3165,7 +3158,6 @@ def save_schema_json(out_dir, base, execution=None, out_dir_override=None):
             "cmp_inst_count is separate from arith_bitwise_count",
             "mem_inst_count counts explicit memory-access instructions only",
             "calls are counted in call_count only",
-            "APageRank disabled by default",
             "If --input-file points to a .i64 database, output basename may include the .i64 suffix",
         ],
     }
@@ -3265,9 +3257,9 @@ def parse_cli_args(argv):
     # ---- Sancov-site Voronoi aggregation flags (Decision 9 / 3 / 10) ----
     parser.add_argument(
         "--sancov-agg-mode",
-        choices=["none", "voronoi-weighted-mean"],
-        default="voronoi-weighted-mean",
-        help="Aggregation mode for sancov-aligned runtime feature maps.",
+        choices=["none", "sum"],
+        default="sum",
+        help="Aggregation mode for sancov-aligned runtime feature maps. Default: sum.",
     )
     parser.add_argument(
         "--sancov-voronoi-distance",
@@ -3488,20 +3480,6 @@ def run_extraction(args):
 
     normalize_blocks(blocks)
 
-    if USE_APAGERANK:
-        if feature == "semantic":
-            ap_attrs = INSTRUCTION_ATTRS
-        elif feature == "graph":
-            ap_attrs = STRUCTURAL_ATTRS
-        else:
-            ap_attrs = ATTR_NAMES
-
-        print(f"[+] Running Attributed PageRank on {len(ap_attrs)} attributes")
-        apagerank_time_start = time.time()
-        run_apagerank(CFG, blocks, ap_attrs)
-        apagerank_time_end = time.time()
-        print(f"    APageRank Time: {apagerank_time_end - apagerank_time_start:.2f}s")
-
     validate_features(pcs, CFG, blocks)
 
     reachable_edges = count_reachable_edges(CFG, func_of_bb, target_funcs)
@@ -3558,8 +3536,8 @@ def run_extraction(args):
     # Voronoi-aggregated runtime feature arrays (sancov-aligned)
     # =====================================================================
     schema_features = _build_runtime_schema()["features"]
-    if args.sancov_agg_mode == "voronoi-weighted-mean":
-        print("[+] Aggregating runtime features via Voronoi weighted mean ...")
+    if args.sancov_agg_mode == "sum":
+        print("[+] Aggregating runtime features via Voronoi region sums ...")
         feature_arrays_by_name = build_voronoi_runtime_feature_arrays(
             blocks, node_order, schema_features, sancov_seeds,
             regions_by_sancov, node_assignment, args.sancov_voronoi_gamma,
@@ -3582,6 +3560,11 @@ def run_extraction(args):
                        for spec in schema_features]
             for spec, v in zip(schema_features, vec):
                 feature_arrays_by_name[spec["name"]].append(v)
+        for spec in schema_features:
+            name = spec["name"]
+            feature_arrays_by_name[name] = _normalize_nonnegative_log1p_minmax_feature(
+                name, feature_arrays_by_name[name],
+            )
 
     # Keyed by ATTR_NAMES for backward-compat downstream consumers.
     attr_arrays = {name: feature_arrays_by_name[name] for name in ATTR_NAMES}
@@ -3626,7 +3609,7 @@ def run_extraction(args):
                 "note": seed.get("note", "unmapped"),
             }
         else:
-            weight = finite_or_zero(directional_weight(vec_norm))
+            weight = max(0.0, finite_or_zero(directional_weight(vec_norm)))
             seed_ea = node_order[node_i]
             b = blocks[seed_ea]
             entry = {
@@ -3640,6 +3623,8 @@ def run_extraction(args):
                 "voronoi_region_size": len(region),
                 "weight": weight,
             }
+        if not math.isfinite(float(weight)) or weight < 0.0:
+            raise RuntimeError(f"invalid default feature-map weight at {sancov_index}: {weight}")
         default_fmap.append(weight)
         dbg_entries.append(entry)
 
@@ -3653,12 +3638,7 @@ def run_extraction(args):
     dbg_payload = {
         "schema_version": FEATURE_SCHEMA_VERSION,
         "attr_names": ATTR_NAMES,
-        "normalization": {
-            "default": "zscore(raw)",
-            "log1p_features": sorted(LOG1P_FEATURES),
-            "raw_binary_features": sorted(RAW_BINARY_FEATURES),
-        },
-        "apagerank_enabled": USE_APAGERANK,
+        "normalization": normalization_metadata(),
         "reachable_edges": reachable_edges,
         "runtime_map_aggregation": {
             "mode": args.sancov_agg_mode,
@@ -3697,6 +3677,11 @@ def run_extraction(args):
         gamma=args.sancov_voronoi_gamma,
         distance_mode=args.sancov_voronoi_distance,
         aggregation_mode=args.sancov_agg_mode,
+    )
+
+    sancov_acfg_path = save_sancov_acfg_json(
+        out_dir, base, target_name, sancov_seeds, regions_by_sancov,
+        node_assignment, acfg_adj,
     )
 
     stats_path = None
@@ -3765,6 +3750,7 @@ def run_extraction(args):
     print(f"    Debug          : {dbg_path}")
     print(f"    ACFG           : {acfg_path}")
     print(f"    ACFG Voronoi   : {voronoi_path}")
+    print(f"    Sancov ACFG    : {sancov_acfg_path}")
     if stats_path:
         print(f"    Statistics            : {stats_path}")
         print(f"    Top4 mask             : {top4_mask_path}")
@@ -3774,7 +3760,6 @@ def run_extraction(args):
         print(f"    Random6 base seed     : 0x{int(args.random_feature_seed):x}")
     print(f"    Schema         : {schema_path}")
     print(f"    Runtime schema : {runtime_schema_path}")
-    print(f"    APageRank      : {'enabled' if USE_APAGERANK else 'disabled'}")
     print(f"    Sancov agg     : {args.sancov_agg_mode} gamma={args.sancov_voronoi_gamma}")
     print(f"    Moran edge     : {args.acfg_edge_mode}")
     print(f"    Mode           : {execution['mode']}")

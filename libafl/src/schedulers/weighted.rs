@@ -9,7 +9,7 @@ use hashbrown::HashMap;
 use libafl_bolts::{
     rands::Rand,
     tuples::{Handle, Handled, MatchName},
-    Named,
+    Named, SerdeAny,
 };
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +93,15 @@ impl WeightedScheduleMetadata {
 }
 
 libafl_bolts::impl_serdeany!(WeightedScheduleMetadata);
+
+/// Metadata used to request a lazy rebuild of a weighted scheduler alias table.
+#[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
+pub struct WeightedAliasTableDirtyMeta {
+    /// Feature-weight iteration that requested the invalidation.
+    pub iteration: u64,
+    /// Whether the alias table should be rebuilt before the next weighted pick.
+    pub dirty: bool,
+}
 
 /// A corpus scheduler using power schedules with weighted queue item selection algo.
 #[derive(Clone, Debug)]
@@ -325,6 +334,17 @@ where
     }
 
     fn next(&mut self, state: &mut S) -> Result<CorpusId, Error> {
+        let dirty = state
+            .metadata_map()
+            .get::<WeightedAliasTableDirtyMeta>()
+            .map(|m| m.dirty)
+            .unwrap_or(false);
+        if dirty {
+            self.table_invalidated = true;
+            let m = state.metadata_mut::<WeightedAliasTableDirtyMeta>()?;
+            m.dirty = false;
+        }
+
         if self.table_invalidated {
             self.create_alias_table(state)?;
             self.table_invalidated = false;

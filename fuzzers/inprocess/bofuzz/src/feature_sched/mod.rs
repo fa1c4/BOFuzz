@@ -1,13 +1,21 @@
 pub mod accounting_stage;
 pub mod factor;
 pub mod features_map;
+pub mod frontier;
+pub mod frontier_credit_feedback;
 pub mod metadata;
 pub mod sancov_index_feedback;
 pub mod stats;
+pub mod weight_refresh;
 
 pub use accounting_stage::FeaturesAccountingStage;
 pub use factor::FactorParams;
-pub use metadata::{FeatureSchemaFile, FeatureSpec, FeaturesMapMeta, SancovIndexesMetadata};
+pub use frontier_credit_feedback::FrontierCreditFeedback;
+pub use metadata::{
+    CoverageDeltaMeta, CoverageProgressMeta, FeatureSchemaFile, FeatureSpec, FeaturesMapMeta,
+    FrontierMeta, SancovAcfgMeta, SancovIndexesMetadata, TestcaseFeatureWeightMeta,
+    TpeIterationMeta, TpePhase, WeightComputeMode, WeightComputeModeMeta,
+};
 pub use sancov_index_feedback::SancovIndexFeedback;
 
 use libafl_bolts::current_time;
@@ -17,7 +25,10 @@ pub mod tpe_stage;
 pub use tpe::{TpeOptimizer, TpeParams};
 pub use tpe_stage::TpeStage;
 
-pub use metadata::{FactorParamsMeta, FeatureGlobalsMeta, FeaturesMatrixMeta, TpeHistoryMeta};
+pub use metadata::{
+    ExploreCreditHistoryMeta, ExploreCreditMeta, FactorParamsMeta, FeatureGlobalsMeta,
+    FeaturesMatrixMeta, TpeHistoryMeta,
+};
 
 use libafl::common::HasMetadata;
 use libafl::schedulers::testcase_score::FeatModeMeta;

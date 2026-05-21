@@ -1,6 +1,6 @@
-use std::{fmt, fmt::Write, time::Duration};
+use std::{fmt, time::Duration};
 
-use libafl::monitors::{ClientStats, Monitor, UserStats, UserStatsValue};
+use libafl::monitors::{ClientStats, Monitor, UserStatsValue};
 use libafl_bolts::{current_time, format_duration_hms, ClientId};
 
 #[derive(Clone)]

@@ -24,7 +24,7 @@ pub mod accounting;
 pub use accounting::CoverageAccountingScheduler;
 
 pub mod weighted;
-pub use weighted::{StdWeightedScheduler, WeightedScheduler};
+pub use weighted::{StdWeightedScheduler, WeightedAliasTableDirtyMeta, WeightedScheduler};
 
 pub mod tuneable;
 use libafl_bolts::{

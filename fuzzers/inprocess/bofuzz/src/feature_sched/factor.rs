@@ -1,7 +1,10 @@
 /*
 feature_sched/factor.rs: calculate the features factor
 */
-use super::metadata::{GlobalStatsMeta, PathWeightMeta};
+use super::metadata::{
+    GlobalStatsMeta, PathWeightMeta, TestcaseFeatureWeightMeta, WeightComputeMode,
+    WeightComputeModeMeta,
+};
 use serde::{Deserialize, Serialize};
 // use libafl::state::HasMetadata;
 use crate::feature_sched::get_features_enabled;
@@ -19,10 +22,10 @@ pub struct FactorParams {
 impl Default for FactorParams {
     fn default() -> Self {
         Self {
-            alpha: 0.0,
+            alpha: 0.85,
             beta: 0.6,
-            gmin: 0.0,
-            gmax: 3.0,
+            gmin: 0.5,
+            gmax: 2.0,
             use_tanh: false,
         }
     }
@@ -44,26 +47,34 @@ pub fn compute_factor<S: HasMetadata>(
         return 1.0;
     };
     let stats = stats_meta.stats.clone();
-    let Some(pw) = entry.metadata_map().get::<PathWeightMeta>() else {
+    let mode = state
+        .metadata_map()
+        .get::<WeightComputeModeMeta>()
+        .map(|m| m.mode)
+        .unwrap_or_default();
+
+    let w = match mode {
+        WeightComputeMode::Frontier => entry
+            .metadata_map()
+            .get::<TestcaseFeatureWeightMeta>()
+            .map(|m| m.weight),
+        WeightComputeMode::Path => entry.metadata_map().get::<PathWeightMeta>().map(|m| m.w),
+    };
+    let Some(w) = w else {
         return 1.0;
     };
     if stats.n < 2 {
         return 1.0; // paths count too few, do not statistic
     }
 
-    let w = pw.w;
     let z = (w - stats.mu) / (stats.sigma() + 1e-9);
 
-    let mut g = if params.use_tanh {
-        1.0 + (params.beta * z).tanh() // (0,2)
+    let raw_g = if params.use_tanh {
+        1.0 + (params.beta * z).tanh()
     } else {
-        (params.beta * z).exp() // (0, +inf)
+        (params.beta * z).exp()
     };
-    if !g.is_finite() {
-        g = 1.0;
-    }
-    g = g.clamp(params.gmin, params.gmax);
-
-    // 1.0 + alpha * (g - 1.0)
-    1.0 + params.alpha * (g - 1.0)
+    let raw_g = if raw_g.is_finite() { raw_g } else { 1.0 };
+    let blended = 1.0 + params.alpha * (raw_g - 1.0);
+    blended.clamp(params.gmin, params.gmax)
 }
