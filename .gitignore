@@ -1,7 +1,7 @@
 # ignore test fuzzing files
 fuzzers/inprocess/**
-!fuzzers/inprocess/libfun/
-!fuzzers/inprocess/libfun/**
+!fuzzers/inprocess/bofuzz/
+!fuzzers/inprocess/bofuzz/**
 /example/work/
 /eval/results/
 
@@ -10,6 +10,10 @@ plans/
 
 # ignore benchs
 benchs/
+run_all_benchs.sh
+extractor_run_logs/
+verify_abs_ranking.py
+
 
 # original ignore
 target

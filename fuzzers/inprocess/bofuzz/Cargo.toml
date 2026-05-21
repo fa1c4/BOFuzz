@@ -1,0 +1,53 @@
+[package]
+name = "bofuzz"
+version = "0.15.0"
+authors = [
+  "fa1c4 <azesinter@mail.ustc.edu.cn>",
+]
+edition = "2021"
+
+[features]
+default = ["std"]
+std = []
+no_link_main = ["libafl_targets/libfuzzer_no_link_main"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+debug = true
+
+[profile.release-bofuzz]
+inherits = "release"
+debug = false
+opt-level = 3
+strip = true
+
+[build-dependencies]
+cc = { version = "1.0.106", features = ["parallel"] }
+which = "6.0.3"
+
+[dependencies]
+libafl = { path = "../../../libafl" }
+libafl_bolts = { path = "../../../libafl_bolts" }
+libafl_targets = { path = "../../../libafl_targets", features = [
+  "sancov_pcguard_hitcounts",
+  "sancov_cmplog",
+  "libfuzzer",
+] }
+libafl_cc = { path = "../../../libafl_cc" }
+log = { version = "0.4.22", features = ["release_max_level_info"] }
+clap = { version = "4.5.18", features = ["default"] }
+nix = { version = "0.29.0", features = ["fs"] }
+mimalloc = { version = "0.1.43", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+once_cell = "1.19"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "bofuzz"
+crate-type = ["staticlib"]
