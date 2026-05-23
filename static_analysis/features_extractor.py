@@ -24,16 +24,16 @@ cd ~/BOFuzz
 python3 static_analysis/features_extractor.py --help
 
 # Acceptance #2 + #8/#9 — Mode B with --output-dir
-python3 static_analysis/features_extractor.py --idapro --ida-dir /data/zym/ida-pro-9.3 \
+python3 static_analysis/features_extractor.py --idapro --ida-dir /path/to/ida-pro-9.3 \
   --input-file benchs/lcms/cms_transform_fuzzer --output-dir /tmp/cms_features
 #  -> 20 files in /tmp/cms_features/
 #  -> merged map has 16 keys, every array length 7713 (matches collected PCs)
 #  -> schema execution.mode == "idapro"
 
 # Default-dir variant — outputs go to benchs/lcms/
-python3 static_analysis/features_extractor.py --idapro --ida-dir /data/zym/ida-pro-9.3 \
+python3 static_analysis/features_extractor.py --idapro --ida-dir /path/to/ida-pro-9.3 \
   --input-file benchs/lcms/cms_transform_fuzzer
-#  -> outputs land in /data/zym/BOFuzz/benchs/lcms/
+#  -> outputs land in /path/to/BOFuzz/benchs/lcms/
 """
 
 import argparse
