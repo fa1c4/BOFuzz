@@ -3,7 +3,7 @@ use core::num::NonZeroUsize;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use libafl::common::HasMetadata;
+use libafl::{common::HasMetadata, Error};
 use libafl_bolts::{
     current_time,
     rands::{Rand, StdRand},
@@ -12,7 +12,7 @@ use libafl_bolts::{
 use crate::feature_sched::features_map::{normalize_simplex_eps, EPS};
 use crate::feature_sched::{
     get_active_dim, get_v_candidates, push_v_candidate, replace_v_candidates, vecn_eq,
-    ExploreCreditMeta, TpeHistoryMeta,
+    TpeHistoryMeta,
 };
 
 const MAX_TRIALS: usize = 1024;
@@ -46,6 +46,7 @@ pub struct TpeTrial {
     pub iteration: u64,
     pub vector: Vec<f64>,
     pub reward: f64,
+    #[allow(dead_code)]
     pub active_start_ms: u64,
     pub active_end_ms: u64,
 }
@@ -64,8 +65,8 @@ fn now_epoch_ms() -> u64 {
 }
 
 fn rand_gaussian(rng: &mut StdRand) -> f64 {
-    let u1 = (rng.next_float() as f64).clamp(f64::MIN_POSITIVE, 1.0);
-    let u2 = rng.next_float() as f64;
+    let u1 = rng.next_float().clamp(f64::MIN_POSITIVE, 1.0);
+    let u2 = rng.next_float();
     let r = (-2.0 * u1.ln()).sqrt();
     let theta = 2.0 * core::f64::consts::PI * u2;
     r * theta.cos()
@@ -165,6 +166,34 @@ pub fn inverse_simplex(best: &[f64]) -> Vec<f64> {
     normalize_simplex_eps(&inv).unwrap_or_else(|_| vec![1.0 / best.len().max(1) as f64; best.len()])
 }
 
+fn normalize_simplex_exact(v: &[f64]) -> Result<Vec<f64>, Error> {
+    if v.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sum = 0.0;
+    for (idx, &value) in v.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(Error::illegal_argument(format!(
+                "BOFuzz vector error: non-finite simplex weight at index {}",
+                idx
+            )));
+        }
+        if value < 0.0 {
+            return Err(Error::illegal_argument(format!(
+                "BOFuzz vector error: negative simplex weight at index {}",
+                idx
+            )));
+        }
+        sum += value;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(Error::illegal_argument(
+            "BOFuzz vector error: simplex denominator is zero".to_string(),
+        ));
+    }
+    Ok(v.iter().map(|value| *value / sum).collect())
+}
+
 pub struct TpeOptimizer {
     pub params: TpeParams,
     pub state: RwLock<TpeState>,
@@ -206,6 +235,7 @@ impl TpeOptimizer {
         s.last_vec = normalize_simplex_eps(v).unwrap_or_else(|_| v.to_vec());
     }
 
+    #[allow(dead_code)]
     pub fn last_vec(&self) -> Vec<f64> {
         self.state.read().unwrap().last_vec.clone()
     }
@@ -278,29 +308,28 @@ impl TpeOptimizer {
         }
     }
 
-    pub fn enqueue_prior_candidates_from_credits<S: HasMetadata>(
+    pub fn enqueue_exact_then_neighbor_candidates<S: HasMetadata>(
         &self,
         state: &mut S,
+        exact_center: &[f64],
         rng: &mut StdRand,
-    ) {
+    ) -> Result<(), Error> {
         let active_dim = get_active_dim(state);
-        if active_dim == 0 {
-            return;
+        if exact_center.len() != active_dim {
+            return Err(Error::illegal_argument(format!(
+                "BOFuzz vector error: exact center length {} != active_dim {}",
+                exact_center.len(),
+                active_dim
+            )));
         }
-        let credits = state
-            .metadata_map()
-            .get::<ExploreCreditMeta>()
-            .map(|m| m.credits.clone())
-            .unwrap_or_default();
-        let positive = credits.iter().copied().filter(|v| *v > 0.0).sum::<f64>();
-        let center = if credits.len() == active_dim && positive > EPS {
-            normalize_simplex_eps(&credits)
-                .unwrap_or_else(|_| vec![1.0 / active_dim as f64; active_dim])
-        } else {
-            eprintln!("BOFuzz warning: no positive explore credits collected; using equal feature distribution as KDE prior center");
-            vec![1.0 / active_dim as f64; active_dim]
-        };
-        self.enqueue_samples_around(state, &center, self.params.samples, rng);
+        if active_dim == 0 {
+            return Ok(());
+        }
+
+        let exact_normalized_center = normalize_simplex_exact(exact_center)?;
+        push_v_candidate(state, exact_normalized_center.clone());
+        self.enqueue_samples_around(state, &exact_normalized_center, self.params.samples, rng);
+        Ok(())
     }
 
     pub fn enqueue_samples_around<S: HasMetadata>(
@@ -377,6 +406,7 @@ impl TpeOptimizer {
         Some(candidate)
     }
 
+    #[allow(clippy::type_complexity)]
     fn split_good_bad(&self) -> Option<(Vec<Vec<f64>>, Vec<Vec<f64>>)> {
         let s = self.state.read().unwrap();
         let positive = s

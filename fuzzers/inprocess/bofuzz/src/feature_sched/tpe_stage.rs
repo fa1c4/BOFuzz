@@ -16,9 +16,14 @@ use libafl::{
 use libafl_bolts::current_time;
 use libafl_bolts::rands::StdRand;
 
-use super::features_map::apply_v_to_features;
+use super::features_map::{apply_v_to_features, install_committed_runtime_mask};
+use super::mask_selection::{
+    equal_simplex, mask_to_bitstring, normalize_credit_or_equal_simplex, project_vector_by_mask,
+    select_positive_credit_top_k_mask,
+};
 use super::metadata::{
-    FeaturesMapMeta, TpeIterationMeta, TpePhase, WeightComputeMode, WeightComputeModeMeta,
+    FeatureSchemaFile, FeaturesMapMeta, TpeInitSource, TpeIterationMeta, TpePhase, VecMaskMode,
+    VecMaskRuntimeMeta, WeightComputeMode, WeightComputeModeMeta,
 };
 use super::tpe::{TpeOptimizer, TpeParams};
 use super::weight_refresh::{
@@ -26,10 +31,13 @@ use super::weight_refresh::{
     WeightRecomputeResult,
 };
 use super::{
-    get_active_dim, get_current_weight_vec, get_explore_time, get_feat_exists, get_feat_mode,
-    get_fuzz_start, get_tpe_satisfied, get_v_candidates, set_features_active,
+    get_active_dim, get_active_feature_names, get_current_weight_vec, get_explore_time,
+    get_feat_exists, get_feat_mode, get_fuzz_start, get_schema_features, get_schema_version,
+    get_tpe_satisfied, get_v_candidates, get_vec_mask, replace_v_candidates, set_features_active,
+    validate_committed_vector_dimensions,
 };
-use crate::feature_sched::ExploreCreditMeta;
+use crate::feature_sched::runtime_data::maybe_export_runtime_data;
+use crate::feature_sched::{ExploreCreditMeta, RuntimeCreditMeta};
 
 pub struct TpeStage {
     pub opt: TpeOptimizer,
@@ -202,6 +210,281 @@ impl TpeStage {
         }
     }
 
+    fn schema_from_state<S: HasMetadata>(state: &S) -> FeatureSchemaFile {
+        FeatureSchemaFile {
+            schema_version: get_schema_version(state),
+            features: get_schema_features(state),
+        }
+    }
+
+    fn credits_with_dim(credits: Vec<f64>, dim: usize, label: &str) -> Result<Vec<f64>, Error> {
+        if credits.is_empty() {
+            return Ok(vec![0.0; dim]);
+        }
+        if credits.len() != dim {
+            return Err(Error::illegal_state(format!(
+                "BOFuzz {} credit length {} != expected dimension {}",
+                label,
+                credits.len(),
+                dim
+            )));
+        }
+        Ok(credits)
+    }
+
+    fn positive_credit_stats(credits: &[f64]) -> (usize, f64) {
+        let mut count = 0;
+        let mut sum = 0.0;
+        for &credit in credits {
+            if credit > 0.0 {
+                count += 1;
+                sum += credit;
+            }
+        }
+        (count, sum)
+    }
+
+    fn selected_names(schema: &FeatureSchemaFile, mask: &[bool]) -> Vec<String> {
+        schema
+            .features
+            .iter()
+            .zip(mask.iter())
+            .filter(|(_, enabled)| **enabled)
+            .map(|(feature, _)| feature.name.clone())
+            .collect()
+    }
+
+    fn selected_indices(mask: &[bool]) -> Vec<usize> {
+        mask.iter()
+            .enumerate()
+            .filter_map(|(idx, enabled)| enabled.then_some(idx))
+            .collect()
+    }
+
+    fn set_runtime_meta<S: HasMetadata>(state: &mut S, runtime: VecMaskRuntimeMeta) {
+        state.add_metadata(runtime);
+    }
+
+    fn commit_mask_and_tpe_initialization_before_first_tpe<S, EM>(
+        &mut self,
+        state: &mut S,
+        _mgr: &mut EM,
+    ) -> Result<(), Error>
+    where
+        S: HasMetadata,
+    {
+        let mut runtime = state
+            .metadata_map()
+            .get::<VecMaskRuntimeMeta>()
+            .cloned()
+            .unwrap_or_default();
+
+        if runtime.tpe_init_committed {
+            validate_committed_vector_dimensions(state)?;
+            return Ok(());
+        }
+
+        let schema = Self::schema_from_state(state);
+        let schema_dim = schema.features.len();
+        let explore_credits_raw = state
+            .metadata_map()
+            .get::<ExploreCreditMeta>()
+            .map(|meta| meta.credits.clone())
+            .unwrap_or_default();
+
+        match runtime.mode {
+            VecMaskMode::Full => {
+                let active_dim = get_active_dim(state);
+                if active_dim != schema_dim {
+                    return Err(Error::illegal_state(format!(
+                        "BOFuzz full-mode error: active_dim {} != schema_dim {}",
+                        active_dim, schema_dim
+                    )));
+                }
+                let credits = Self::credits_with_dim(explore_credits_raw, active_dim, "full")?;
+                let (normalized, has_positive, positive_sum) =
+                    normalize_credit_or_equal_simplex(&credits).map_err(Error::illegal_state)?;
+                let (positive_count, _) = Self::positive_credit_stats(&credits);
+
+                runtime.mask_committed = true;
+                runtime.tpe_init_committed = true;
+                runtime.effective_mask = vec![true; schema_dim];
+                runtime.selected_feature_names =
+                    Self::selected_names(&schema, &runtime.effective_mask);
+                runtime.selected_schema_indices = Self::selected_indices(&runtime.effective_mask);
+                runtime.explore_credits_full = credits.clone();
+                runtime.explore_credits_active = credits.clone();
+                runtime.normalized_credit_init_v = normalized.clone();
+                runtime.positive_credit_count = positive_count;
+                runtime.positive_credit_sum = positive_sum;
+                runtime.fallback_reason = None;
+                runtime.tpe_init_source = if runtime.candidate_file_loaded {
+                    Some(TpeInitSource::ExternalCandidateFile)
+                } else if has_positive {
+                    Some(TpeInitSource::ExploreCreditsExactFirst)
+                } else {
+                    Some(TpeInitSource::EqualSimplexFallback)
+                };
+
+                let source = runtime.tpe_init_source.clone();
+                let candidate_loaded = runtime.candidate_file_loaded;
+                Self::set_runtime_meta(state, runtime.clone());
+                if !candidate_loaded {
+                    replace_v_candidates(state, Vec::new());
+                    self.opt.enqueue_exact_then_neighbor_candidates(
+                        state,
+                        &normalized,
+                        &mut self.rng,
+                    )?;
+                }
+                eprintln!(
+                    "[BOFuzz mask] mode=full status=tpe-init source={:?} active_dim={} mask={} credits_active={:?} normalized_credit_init_v={:?}",
+                    source,
+                    active_dim,
+                    mask_to_bitstring(&runtime.effective_mask),
+                    credits,
+                    normalized
+                );
+            }
+            VecMaskMode::Explicit => {
+                let requested = runtime.requested_explicit_mask.clone().ok_or_else(|| {
+                    Error::illegal_state(
+                        "BOFuzz explicit-mode error: missing persisted explicit mask".to_string(),
+                    )
+                })?;
+                if get_vec_mask(state) != requested {
+                    return Err(Error::illegal_state(
+                        "BOFuzz resume error: explicit vec-mask differs from persisted committed mask"
+                            .to_string(),
+                    ));
+                }
+                let active_dim = get_active_dim(state);
+                let credits = Self::credits_with_dim(explore_credits_raw, active_dim, "explicit")?;
+                let (normalized, has_positive, positive_sum) =
+                    normalize_credit_or_equal_simplex(&credits).map_err(Error::illegal_state)?;
+                let (positive_count, _) = Self::positive_credit_stats(&credits);
+
+                runtime.mask_committed = true;
+                runtime.tpe_init_committed = true;
+                runtime.effective_mask = requested;
+                runtime.selected_feature_names = get_active_feature_names(state);
+                runtime.selected_schema_indices = Self::selected_indices(&runtime.effective_mask);
+                runtime.explore_credits_full = Vec::new();
+                runtime.explore_credits_active = credits.clone();
+                runtime.normalized_credit_init_v = normalized.clone();
+                runtime.positive_credit_count = positive_count;
+                runtime.positive_credit_sum = positive_sum;
+                runtime.fallback_reason = None;
+                runtime.tpe_init_source = if runtime.candidate_file_loaded {
+                    Some(TpeInitSource::ExternalCandidateFile)
+                } else if has_positive {
+                    Some(TpeInitSource::ExploreCreditsExactFirst)
+                } else {
+                    Some(TpeInitSource::EqualSimplexFallback)
+                };
+
+                let source = runtime.tpe_init_source.clone();
+                let candidate_loaded = runtime.candidate_file_loaded;
+                Self::set_runtime_meta(state, runtime.clone());
+                if !candidate_loaded {
+                    replace_v_candidates(state, Vec::new());
+                    self.opt.enqueue_exact_then_neighbor_candidates(
+                        state,
+                        &normalized,
+                        &mut self.rng,
+                    )?;
+                }
+                eprintln!(
+                    "[BOFuzz mask] mode=explicit status=tpe-init source={:?} active_dim={} mask={} credits_active={:?} normalized_credit_init_v={:?}",
+                    source,
+                    active_dim,
+                    mask_to_bitstring(&runtime.effective_mask),
+                    credits,
+                    normalized
+                );
+            }
+            VecMaskMode::AutoCredit => {
+                let credits =
+                    Self::credits_with_dim(explore_credits_raw, schema_dim, "auto-credit")?;
+                let (positive_count, positive_sum) = Self::positive_credit_stats(&credits);
+                let selected_mask =
+                    select_positive_credit_top_k_mask(&credits, schema_dim, runtime.credit_top_k)
+                        .map_err(Error::illegal_state)?;
+
+                let (effective_mask, active_credits, normalized, source, fallback_reason) =
+                    if let Some(mask) = selected_mask {
+                        install_committed_runtime_mask(state, &schema, &mask)?;
+                        let active_credits = project_vector_by_mask(&credits, &mask)
+                            .map_err(Error::illegal_state)?;
+                        let (normalized, _, _) = normalize_credit_or_equal_simplex(&active_credits)
+                            .map_err(Error::illegal_state)?;
+                        (
+                            mask,
+                            active_credits,
+                            normalized,
+                            TpeInitSource::ExploreCreditsExactFirst,
+                            None,
+                        )
+                    } else {
+                        let mask = vec![true; schema_dim];
+                        install_committed_runtime_mask(state, &schema, &mask)?;
+                        (
+                            mask,
+                            credits.clone(),
+                            equal_simplex(schema_dim),
+                            TpeInitSource::EqualSimplexFallback,
+                            Some("no_positive_explore_credits".to_string()),
+                        )
+                    };
+
+                runtime.mask_committed = true;
+                runtime.tpe_init_committed = true;
+                runtime.effective_mask = effective_mask;
+                runtime.selected_feature_names =
+                    Self::selected_names(&schema, &runtime.effective_mask);
+                runtime.selected_schema_indices = Self::selected_indices(&runtime.effective_mask);
+                runtime.candidate_file_loaded = false;
+                runtime.tpe_init_source = Some(source.clone());
+                runtime.explore_credits_full = credits.clone();
+                runtime.explore_credits_active = active_credits.clone();
+                runtime.normalized_credit_init_v = normalized.clone();
+                runtime.positive_credit_count = positive_count;
+                runtime.positive_credit_sum = positive_sum;
+                runtime.fallback_reason = fallback_reason.clone();
+                Self::set_runtime_meta(state, runtime.clone());
+
+                self.opt.enqueue_exact_then_neighbor_candidates(
+                    state,
+                    &normalized,
+                    &mut self.rng,
+                )?;
+
+                if fallback_reason.is_some() {
+                    eprintln!(
+                        "[BOFuzz mask] mode=auto-credit status=fallback source=equal-simplex reason=no_positive_explore_credits active_dim={} mask={} normalized_init_v={:?}",
+                        get_active_dim(state),
+                        mask_to_bitstring(&runtime.effective_mask),
+                        normalized
+                    );
+                } else {
+                    eprintln!(
+                        "[BOFuzz mask] mode=auto-credit status=selected source=explore-credits-exact-first top_k={} positive_count={} active_dim={} mask={} credits_full={:?} credits_active={:?} normalized_init_v={:?}",
+                        runtime.credit_top_k,
+                        positive_count,
+                        get_active_dim(state),
+                        mask_to_bitstring(&runtime.effective_mask),
+                        credits,
+                        active_credits,
+                        normalized
+                    );
+                }
+            }
+        }
+
+        validate_committed_vector_dimensions(state)?;
+        Ok(())
+    }
+
     fn report<S, EM>(&mut self, state: &mut S, mgr: &mut EM, text: String) -> Result<(), Error>
     where
         S: HasCorpus<BytesInput>,
@@ -266,6 +549,7 @@ where
         match self.phase(state) {
             TpePhase::Explore => {
                 if !self.explore_done(state) {
+                    maybe_export_runtime_data(state, false)?;
                     let now = Self::now_ms();
                     if now.saturating_sub(self.last_explore_report_ms) > 30_000 {
                         self.last_explore_report_ms = now;
@@ -278,16 +562,22 @@ where
                     return Ok(());
                 }
 
+                self.commit_mask_and_tpe_initialization_before_first_tpe(state, mgr)?;
+
                 if get_v_candidates(state).is_empty() {
-                    self.opt
-                        .enqueue_prior_candidates_from_credits(state, &mut self.rng);
+                    return Err(Error::illegal_state(
+                        "TPE initialization committed without available initial candidate"
+                            .to_string(),
+                    ));
                 }
-                let active_dim = get_active_dim(state);
-                let candidate = self
-                    .opt
-                    .next_untried_from_pool(state)
-                    .unwrap_or_else(|| vec![1.0 / active_dim.max(1) as f64; active_dim]);
+
+                let candidate = self.opt.next_untried_from_pool(state).ok_or_else(|| {
+                    Error::illegal_state(
+                        "BOFuzz failed to retrieve committed initial TPE candidate".to_string(),
+                    )
+                })?;
                 self.start_pending_recompute(state, candidate)?;
+                maybe_export_runtime_data(state, true)?;
                 self.report(
                     state,
                     mgr,
@@ -347,14 +637,21 @@ where
                     self.set_phase(state, TpePhase::LockedBest);
                 }
                 self.opt.persist_to_meta(state);
+                maybe_export_runtime_data(state, true)?;
                 self.report_trials(state, mgr)?;
 
                 let trials_len = self.opt.state.read().unwrap().trials.len();
                 let simplex_sum = last_vec.iter().copied().sum::<f64>();
                 let credits_sum = state
                     .metadata_map()
-                    .get::<ExploreCreditMeta>()
+                    .get::<RuntimeCreditMeta>()
                     .map(|m| m.credits.iter().copied().sum::<f64>())
+                    .or_else(|| {
+                        state
+                            .metadata_map()
+                            .get::<ExploreCreditMeta>()
+                            .map(|m| m.credits.iter().copied().sum::<f64>())
+                    })
                     .unwrap_or(0.0);
                 self.report(
                     state,
@@ -397,6 +694,7 @@ where
                     >= self.opt.params.re_tpe_threshold.as_millis() as u64
                 {
                     self.opt.enqueue_inverse_candidates(state, &mut self.rng);
+                    maybe_export_runtime_data(state, true)?;
                     if let Some(next) = self.opt.next_untried_from_pool(state) {
                         self.start_pending_recompute(state, next)?;
                     }

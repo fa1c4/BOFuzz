@@ -49,6 +49,7 @@ pub enum WeightComputeMode {
     Path,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for WeightComputeMode {
     fn default() -> Self {
         Self::Frontier
@@ -109,6 +110,72 @@ pub struct ExploreCreditHistoryMeta {
     pub entries: Vec<ExploreCreditEntry>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecMaskMode {
+    Full,
+    Explicit,
+    AutoCredit,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for VecMaskMode {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum TpeInitSource {
+    ExternalCandidateFile,
+    ExploreCreditsExactFirst,
+    EqualSimplexFallback,
+}
+
+#[derive(Serialize, Deserialize, SerdeAny, Clone, Debug)]
+pub struct VecMaskRuntimeMeta {
+    pub mode: VecMaskMode,
+    pub credit_top_k: usize,
+    pub requested_explicit_mask: Option<Vec<bool>>,
+    pub mask_committed: bool,
+    pub tpe_init_committed: bool,
+    pub effective_mask: Vec<bool>,
+    pub selected_feature_names: Vec<String>,
+    pub selected_schema_indices: Vec<usize>,
+    pub candidate_file_path: Option<String>,
+    pub candidate_file_loaded: bool,
+    pub tpe_init_source: Option<TpeInitSource>,
+    pub explore_credits_full: Vec<f64>,
+    pub explore_credits_active: Vec<f64>,
+    pub normalized_credit_init_v: Vec<f64>,
+    pub positive_credit_count: usize,
+    pub positive_credit_sum: f64,
+    pub fallback_reason: Option<String>,
+}
+
+impl Default for VecMaskRuntimeMeta {
+    fn default() -> Self {
+        Self {
+            mode: VecMaskMode::Full,
+            credit_top_k: 8,
+            requested_explicit_mask: None,
+            mask_committed: false,
+            tpe_init_committed: false,
+            effective_mask: Vec::new(),
+            selected_feature_names: Vec::new(),
+            selected_schema_indices: Vec::new(),
+            candidate_file_path: None,
+            candidate_file_loaded: false,
+            tpe_init_source: None,
+            explore_credits_full: Vec::new(),
+            explore_credits_active: Vec::new(),
+            normalized_credit_init_v: Vec::new(),
+            positive_credit_count: 0,
+            positive_credit_sum: 0.0,
+            fallback_reason: None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
 pub struct FeatureVectorMeta {
     pub iteration: u64,
@@ -123,6 +190,7 @@ pub enum TpePhase {
     LockedBest,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for TpePhase {
     fn default() -> Self {
         Self::Explore
@@ -138,6 +206,29 @@ pub struct TpeIterationMeta {
     pub active_start_ms: Option<u64>,
     pub active_start_edges: Option<u64>,
     pub last_new_edges_ms: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
+pub struct RuntimeCreditMeta {
+    pub iteration: u64,
+    pub credits: Vec<f64>,
+    pub total_delta_edges: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RuntimeCreditEntry {
+    pub iteration: u64,
+    pub phase: TpePhase,
+    pub corpus_id: Option<CorpusId>,
+    pub delta_edges: u64,
+    pub frontier_nodes: Vec<usize>,
+    pub credit_delta: Vec<f64>,
+    pub cumulative_credits: Vec<f64>,
+}
+
+#[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
+pub struct RuntimeCreditHistoryMeta {
+    pub entries: Vec<RuntimeCreditEntry>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -215,4 +306,10 @@ pub struct TpeHistoryMeta {
 #[derive(Serialize, Deserialize, SerdeAny, Clone, Debug)]
 pub struct FactorParamsMeta {
     pub params: super::factor::FactorParams,
+}
+
+#[derive(Serialize, Deserialize, SerdeAny, Clone, Debug, Default)]
+pub struct RuntimeDataExportMeta {
+    pub output_path: String,
+    pub last_export_ms: u64,
 }

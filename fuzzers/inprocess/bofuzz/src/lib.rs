@@ -14,7 +14,7 @@ use std::{
     process,
 };
 
-use clap::{Arg, Command};
+use clap::{parser::ValueSource, Arg, Command};
 use libafl::{
     corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus},
     events::SimpleRestartingEventManager,
@@ -60,13 +60,16 @@ mod feature_sched;
 use crate::feature_sched::{
     features_map::{
         compute_active_features, load_and_align_features_map, load_and_validate_feature_map,
-        load_and_validate_schema, parse_vec_mask,
+        load_and_validate_schema, parse_vec_mask, CandidateFilePolicy,
     },
-    get_features_enabled, get_fuzz_start, set_alpha_init, set_explore_time, set_factor_params,
-    set_feat_exists, set_feat_mode, set_fuzz_start, set_schema_info, set_tpe_period, FactorParams,
-    FeaturesAccountingStage, FeaturesMapMeta, FeaturesMatrixMeta, FrontierCreditFeedback,
-    SancovAcfgMeta, SancovIndexFeedback, TpeIterationMeta, WeightComputeMode,
-    WeightComputeModeMeta,
+    get_features_enabled, get_fuzz_start,
+    mask_selection::mask_to_bitstring,
+    runtime_data::maybe_export_runtime_data,
+    set_alpha_init, set_explore_time, set_factor_params, set_feat_exists, set_feat_mode,
+    set_fuzz_start, set_schema_info, set_tpe_period, validate_committed_vector_dimensions,
+    FactorParams, FeaturesAccountingStage, FeaturesMapMeta, FeaturesMatrixMeta,
+    FrontierCreditFeedback, RuntimeDataExportMeta, SancovAcfgMeta, SancovIndexFeedback,
+    TpeIterationMeta, VecMaskMode, VecMaskRuntimeMeta, WeightComputeMode, WeightComputeModeMeta,
 };
 mod custom_monitor;
 use crate::custom_monitor::CustomMonitor;
@@ -94,6 +97,210 @@ struct BofuzzArgs {
     trials_threshold: usize,
     re_tpe_threshold_secs: u64,
     sancov_acfg_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct VecMaskConfig {
+    mode: VecMaskMode,
+    explicit_mask: Option<Vec<bool>>,
+    credit_top_k: usize,
+}
+
+fn vec_mask_mode_label(mode: VecMaskMode) -> &'static str {
+    match mode {
+        VecMaskMode::Full => "full",
+        VecMaskMode::Explicit => "explicit",
+        VecMaskMode::AutoCredit => "auto-credit",
+    }
+}
+
+fn selected_schema_indices(mask: &[bool]) -> Vec<usize> {
+    mask.iter()
+        .enumerate()
+        .filter_map(|(idx, enabled)| enabled.then_some(idx))
+        .collect()
+}
+
+fn resolve_vec_mask_config(
+    raw_mask: Option<&str>,
+    credit_top_k: usize,
+    schema_dim: usize,
+) -> Result<VecMaskConfig, String> {
+    match raw_mask {
+        Some(mask) if mask.trim() == "auto-credit" => {
+            if credit_top_k == 0 || credit_top_k > schema_dim {
+                return Err(format!(
+                    "BOFuzz auto-credit error: --credit-top-k must be in 1..={} when --vec-mask auto-credit is selected",
+                    schema_dim
+                ));
+            }
+            Ok(VecMaskConfig {
+                mode: VecMaskMode::AutoCredit,
+                explicit_mask: None,
+                credit_top_k,
+            })
+        }
+        Some(mask) => Ok(VecMaskConfig {
+            mode: VecMaskMode::Explicit,
+            explicit_mask: Some(parse_vec_mask(mask, schema_dim)?),
+            credit_top_k,
+        }),
+        None => Ok(VecMaskConfig {
+            mode: VecMaskMode::Full,
+            explicit_mask: None,
+            credit_top_k,
+        }),
+    }
+}
+
+fn initialize_vec_mask_state<S: HasMetadata>(
+    state: &mut S,
+    schema: &feature_sched::FeatureSchemaFile,
+    config: &VecMaskConfig,
+    is_resumed: bool,
+) -> Result<Vec<feature_sched::FeatureSpec>, Error> {
+    let schema_dim = schema.features.len();
+    let full_mask = vec![true; schema_dim];
+
+    if !is_resumed {
+        let effective_mask = match config.mode {
+            VecMaskMode::Full => full_mask.clone(),
+            VecMaskMode::Explicit => config.explicit_mask.clone().ok_or_else(|| {
+                Error::illegal_argument("BOFuzz explicit mask config missing mask".to_string())
+            })?,
+            VecMaskMode::AutoCredit => full_mask.clone(),
+        };
+        let active_features = compute_active_features(schema, &effective_mask);
+        set_schema_info(
+            state,
+            schema.schema_version,
+            schema.features.clone(),
+            effective_mask.clone(),
+            active_features.clone(),
+        );
+
+        let mut runtime = VecMaskRuntimeMeta {
+            mode: config.mode,
+            credit_top_k: config.credit_top_k,
+            requested_explicit_mask: config.explicit_mask.clone(),
+            mask_committed: !matches!(config.mode, VecMaskMode::AutoCredit),
+            tpe_init_committed: false,
+            effective_mask: effective_mask.clone(),
+            selected_feature_names: active_features.iter().map(|f| f.name.clone()).collect(),
+            selected_schema_indices: selected_schema_indices(&effective_mask),
+            ..Default::default()
+        };
+        if matches!(config.mode, VecMaskMode::Full) {
+            runtime.requested_explicit_mask = None;
+        }
+        state.add_metadata(runtime);
+
+        match config.mode {
+            VecMaskMode::Full => eprintln!(
+                "[BOFuzz mask] mode=full status=locked active_dim={} mask={}",
+                active_features.len(),
+                mask_to_bitstring(&effective_mask)
+            ),
+            VecMaskMode::Explicit => eprintln!(
+                "[BOFuzz mask] mode=explicit status=locked active_dim={} mask={}",
+                active_features.len(),
+                mask_to_bitstring(&effective_mask)
+            ),
+            VecMaskMode::AutoCredit => eprintln!(
+                "[BOFuzz mask] mode=auto-credit status=explore-full top_k={} explore_dim={} mask={}",
+                config.credit_top_k,
+                schema_dim,
+                mask_to_bitstring(&effective_mask)
+            ),
+        }
+        return Ok(active_features);
+    }
+
+    let mut runtime = state
+        .metadata_map()
+        .get::<VecMaskRuntimeMeta>()
+        .cloned()
+        .ok_or_else(|| {
+            Error::illegal_state(
+                "BOFuzz resume error: missing persisted vec-mask runtime metadata".to_string(),
+            )
+        })?;
+
+    if runtime.mode != config.mode {
+        return Err(Error::illegal_state(
+            "BOFuzz resume error: vec-mask mode differs from persisted run".to_string(),
+        ));
+    }
+
+    match config.mode {
+        VecMaskMode::Full => {
+            if runtime.effective_mask != full_mask {
+                return Err(Error::illegal_state(
+                    "BOFuzz resume error: full mode persisted mask is not full schema".to_string(),
+                ));
+            }
+        }
+        VecMaskMode::Explicit => {
+            let requested = config.explicit_mask.clone().ok_or_else(|| {
+                Error::illegal_state(
+                    "BOFuzz resume error: explicit mode requires CLI vec-mask".to_string(),
+                )
+            })?;
+            if runtime.requested_explicit_mask.as_ref() != Some(&requested)
+                || runtime.effective_mask != requested
+            {
+                return Err(Error::illegal_state(
+                    "BOFuzz resume error: explicit vec-mask differs from persisted committed mask"
+                        .to_string(),
+                ));
+            }
+        }
+        VecMaskMode::AutoCredit => {
+            if runtime.credit_top_k != config.credit_top_k {
+                return Err(Error::illegal_state(
+                    "BOFuzz resume error: auto-credit top_k differs from persisted run".to_string(),
+                ));
+            }
+            if !runtime.mask_committed && runtime.effective_mask != full_mask {
+                return Err(Error::illegal_state(
+                    "BOFuzz resume error: pending auto-credit run is not in full-schema Explore"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    let active_features = compute_active_features(schema, &runtime.effective_mask);
+    runtime.selected_feature_names = active_features.iter().map(|f| f.name.clone()).collect();
+    runtime.selected_schema_indices = selected_schema_indices(&runtime.effective_mask);
+    set_schema_info(
+        state,
+        schema.schema_version,
+        schema.features.clone(),
+        runtime.effective_mask.clone(),
+        active_features.clone(),
+    );
+    state.add_metadata(runtime.clone());
+
+    if runtime.tpe_init_committed {
+        validate_committed_vector_dimensions(state)?;
+    }
+
+    let status = match runtime.mode {
+        VecMaskMode::Full => "restored-locked",
+        VecMaskMode::Explicit => "restored-locked",
+        VecMaskMode::AutoCredit if runtime.mask_committed => "restored-committed",
+        VecMaskMode::AutoCredit => "restored-pending",
+    };
+    eprintln!(
+        "[BOFuzz mask] mode={} status={} active_dim={} mask={}",
+        vec_mask_mode_label(runtime.mode),
+        status,
+        active_features.len(),
+        mask_to_bitstring(&runtime.effective_mask)
+    );
+
+    Ok(active_features)
 }
 
 fn resolve_bofuzz_root() -> Option<PathBuf> {
@@ -265,7 +472,14 @@ pub extern "C" fn libafl_main() {
         .arg(
             Arg::new("vec-mask")
                 .long("vec-mask")
-                .help("Feature mask aligned to features_schema.json order. Accepts '[1,0,...]', '1,0,...', or bitstring '1010...'.")
+                .help("Feature mask aligned to features_schema.json order, or 'auto-credit'. Accepts '[1,0,...]', '1,0,...', bitstring '1010...', or 'auto-credit'.")
+        )
+        .arg(
+            Arg::new("credit-top-k")
+                .long("credit-top-k")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("8")
+                .help("Maximum number of positive frontier-credit-ranked features selected when --vec-mask auto-credit is used; default: 8")
         )
         .arg(
             Arg::new("alpha")
@@ -406,6 +620,8 @@ pub extern "C" fn libafl_main() {
             return;
         }
     }
+    let output_root = out_dir.clone();
+    let runtime_data_output_path = output_root.join("runtime_data.json");
     let mut crashes = out_dir.clone();
     crashes.push("crashes");
     out_dir.push("queue");
@@ -462,39 +678,26 @@ pub extern "C" fn libafl_main() {
         schema_path.display()
     );
 
-    // --- Step 3: Parse --vec-mask or default to all-ones ---
-    let vec_mask: Vec<bool> = if let Some(mask_str) = res.get_one::<String>("vec-mask") {
-        match parse_vec_mask(mask_str, schema_dim) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("{}", e);
-                process::exit(1);
-            }
-        }
-    } else {
-        vec![true; schema_dim]
-    };
-
-    // --- Step 4: Compute active features ---
-    let active_features = compute_active_features(&schema, &vec_mask);
-    let active_dim = active_features.len();
-    let mask_str: String = vec_mask
-        .iter()
-        .map(|&b| if b { '1' } else { '0' })
-        .collect();
-
-    eprintln!(
-        "[BOFuzz features] schema={} schema_dim={} active_dim={} mask={} active=[{}]",
-        schema.schema_version,
+    // --- Step 3: Resolve --vec-mask mode and --credit-top-k policy ---
+    let credit_top_k = *res.get_one::<usize>("credit-top-k").unwrap();
+    let vec_mask_config = match resolve_vec_mask_config(
+        res.get_one::<String>("vec-mask").map(String::as_str),
+        credit_top_k,
         schema_dim,
-        active_dim,
-        mask_str,
-        active_features
-            .iter()
-            .map(|f| format!("{}:{}", f.id, f.name))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    ) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    };
+    if vec_mask_config.mode != VecMaskMode::AutoCredit
+        && res.value_source("credit-top-k") == Some(ValueSource::CommandLine)
+    {
+        eprintln!(
+            "[BOFuzz mask] warning: --credit-top-k is ignored unless --vec-mask auto-credit is selected"
+        );
+    }
 
     let cli_features_path = res.get_one::<String>("features").map(PathBuf::from);
     let weight_compute_mode = match parse_weight_compute_mode(
@@ -538,10 +741,80 @@ pub extern "C" fn libafl_main() {
         cli_features_path,
         bofuzz_args,
         schema,
-        vec_mask,
-        active_features,
+        vec_mask_config,
+        runtime_data_output_path,
     )
     .expect("An error occurred while fuzzing");
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_credit_vec_mask_is_accepted() {
+        let config = resolve_vec_mask_config(Some("auto-credit"), 8, 16).unwrap();
+        assert_eq!(config.mode, VecMaskMode::AutoCredit);
+        assert_eq!(config.credit_top_k, 8);
+        assert!(config.explicit_mask.is_none());
+    }
+
+    #[test]
+    fn credit_top_k_defaults_to_eight_when_supplied_as_default() {
+        let config = resolve_vec_mask_config(Some("auto-credit"), 8, 16).unwrap();
+        assert_eq!(config.credit_top_k, 8);
+    }
+
+    #[test]
+    fn credit_top_k_rejected_when_zero_in_auto_mode() {
+        assert!(resolve_vec_mask_config(Some("auto-credit"), 0, 16).is_err());
+    }
+
+    #[test]
+    fn credit_top_k_rejected_when_greater_than_schema_dim() {
+        assert!(resolve_vec_mask_config(Some("auto-credit"), 17, 16).is_err());
+    }
+
+    #[test]
+    fn explicit_bitstring_mask_remains_supported() {
+        let config = resolve_vec_mask_config(Some("1010"), 8, 4).unwrap();
+        assert_eq!(config.mode, VecMaskMode::Explicit);
+        assert_eq!(
+            config.explicit_mask.unwrap(),
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn explicit_comma_mask_remains_supported() {
+        let config = resolve_vec_mask_config(Some("1,0,1,0"), 8, 4).unwrap();
+        assert_eq!(
+            config.explicit_mask.unwrap(),
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn explicit_bracketed_mask_remains_supported() {
+        let config = resolve_vec_mask_config(Some("[1,0,1,0]"), 8, 4).unwrap();
+        assert_eq!(
+            config.explicit_mask.unwrap(),
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn explicit_all_zero_mask_remains_rejected() {
+        assert!(resolve_vec_mask_config(Some("0000"), 8, 4).is_err());
+    }
+
+    #[test]
+    fn no_vec_mask_resolves_to_full_mode() {
+        let config = resolve_vec_mask_config(None, 8, 16).unwrap();
+        assert_eq!(config.mode, VecMaskMode::Full);
+        assert!(config.explicit_mask.is_none());
+    }
 }
 
 fn run_testcases(filenames: &[&str]) {
@@ -569,6 +842,7 @@ fn run_testcases(filenames: &[&str]) {
 
 /// The actual fuzzer
 #[expect(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn fuzz(
     corpus_dir: PathBuf,
     objective_dir: PathBuf,
@@ -579,13 +853,11 @@ fn fuzz(
     cli_features_path: Option<PathBuf>,
     bofuzz_args: BofuzzArgs,
     schema: feature_sched::FeatureSchemaFile,
-    vec_mask: Vec<bool>,
-    active_features: Vec<feature_sched::FeatureSpec>,
+    vec_mask_config: VecMaskConfig,
+    runtime_data_output_path: PathBuf,
 ) -> Result<(), Error> {
     let log = RefCell::new(OpenOptions::new().append(true).create(true).open(logfile)?);
 
-    let active_dim = active_features.len();
-    let active_names: Vec<String> = active_features.iter().map(|f| f.name.clone()).collect();
     let schema_dim = schema.features.len();
 
     #[cfg(unix)]
@@ -663,6 +935,7 @@ fn fuzz(
 
     let mut objective = CrashFeedback::new();
 
+    let is_resumed = state.is_some();
     let mut state = state.unwrap_or_else(|| {
         StdState::new(
             StdRand::new(),
@@ -676,13 +949,26 @@ fn fuzz(
 
     // --- Runtime startup order (Section 4.6) ---
 
-    // 1. Store schema info in state metadata
-    set_schema_info(
-        &mut state,
+    let active_features =
+        initialize_vec_mask_state(&mut state, &schema, &vec_mask_config, is_resumed)?;
+    let active_dim = active_features.len();
+    let active_names: Vec<String> = active_features.iter().map(|f| f.name.clone()).collect();
+    state.add_metadata(RuntimeDataExportMeta {
+        output_path: runtime_data_output_path.display().to_string(),
+        last_export_ms: 0,
+    });
+
+    eprintln!(
+        "[BOFuzz features] schema={} schema_dim={} active_dim={} mask={} active=[{}]",
         schema.schema_version,
-        schema.features.clone(),
-        vec_mask.clone(),
-        active_features.clone(),
+        schema_dim,
+        active_dim,
+        mask_to_bitstring(&feature_sched::get_vec_mask(&state)),
+        active_features
+            .iter()
+            .map(|f| format!("{}:{}", f.id, f.name))
+            .collect::<Vec<_>>()
+            .join(",")
     );
 
     // 2. Set factor params
@@ -722,6 +1008,21 @@ fn fuzz(
         match load_and_validate_feature_map(p, &schema, sancov_sites) {
             Ok(canonical_map) => {
                 // Use the canonicalized map directly (no re-reading raw JSON)
+                let runtime_mask = state
+                    .metadata_map()
+                    .get::<VecMaskRuntimeMeta>()
+                    .cloned()
+                    .unwrap_or_default();
+                let candidate_policy = if runtime_mask.mode == VecMaskMode::AutoCredit {
+                    CandidateFilePolicy::IgnoreExternalFile
+                } else {
+                    CandidateFilePolicy::AllowExternalFile
+                };
+                let restored_current_v = if is_resumed {
+                    feature_sched::get_current_weight_vec(&state)
+                } else {
+                    Vec::new()
+                };
                 match load_and_align_features_map(
                     &mut state,
                     &canonical_map,
@@ -729,11 +1030,42 @@ fn fuzz(
                     active_dim,
                     &active_names,
                     p,
+                    candidate_policy,
+                    vec_mask_mode_label(runtime_mask.mode),
                 ) {
-                    Ok((feats, active_matrix)) => {
+                    Ok(load_result) => {
                         eprintln!("[BOFuzz] using features map: {}", p.display());
-                        pending_feats = Some(feats);
-                        pending_matrix = Some(active_matrix);
+                        if let Some(mask_meta) =
+                            state.metadata_map_mut().get_mut::<VecMaskRuntimeMeta>()
+                        {
+                            if !is_resumed || !mask_meta.tpe_init_committed {
+                                let candidate_path = load_result
+                                    .candidate_status
+                                    .path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string());
+                                if !is_resumed
+                                    || load_result.candidate_status.loaded
+                                    || mask_meta.candidate_file_path.is_none()
+                                {
+                                    mask_meta.candidate_file_path = candidate_path;
+                                }
+                                if mask_meta.mode == VecMaskMode::AutoCredit {
+                                    mask_meta.candidate_file_loaded = false;
+                                } else if !is_resumed || load_result.candidate_status.loaded {
+                                    mask_meta.candidate_file_loaded =
+                                        load_result.candidate_status.loaded;
+                                }
+                            }
+                        }
+                        if is_resumed && !restored_current_v.is_empty() {
+                            feature_sched::set_current_weight_vec(
+                                &mut state,
+                                restored_current_v.clone(),
+                            );
+                        }
+                        pending_feats = Some(load_result.feats);
+                        pending_matrix = Some(load_result.active_matrix);
                         has_feats = true;
                     }
                     Err(e) => {
@@ -753,7 +1085,9 @@ fn fuzz(
         has_feats = false;
     }
 
-    set_fuzz_start(&mut state);
+    if !is_resumed || get_fuzz_start(&state) == 0 {
+        set_fuzz_start(&mut state);
+    }
     eprintln!(
         "[BOFuzz params] fuzz start time: {} s",
         get_fuzz_start(&state) / 1000
@@ -904,13 +1238,14 @@ fn fuzz(
 
     let edges_name = "edges".to_string();
     let tpe_stage = {
-        let mut p = TpeParams::default();
-        p.period = Duration::from_secs(get_tpe_period(&state));
-        p.samples = bofuzz_args.tpe_samples;
-        p.gamma = bofuzz_args.tpe_gamma;
-        p.bw = bofuzz_args.tpe_bw;
-        p.trials_threshold = bofuzz_args.trials_threshold;
-        p.re_tpe_threshold = Duration::from_secs(bofuzz_args.re_tpe_threshold_secs);
+        let p = TpeParams {
+            period: Duration::from_secs(get_tpe_period(&state)),
+            samples: bofuzz_args.tpe_samples,
+            gamma: bofuzz_args.tpe_gamma,
+            bw: bofuzz_args.tpe_bw,
+            trials_threshold: bofuzz_args.trials_threshold,
+            re_tpe_threshold: Duration::from_secs(bofuzz_args.re_tpe_threshold_secs),
+        };
         TpeStage::new(p, edges_name.clone())
     };
 
@@ -933,7 +1268,12 @@ fn fuzz(
 
     if state.must_load_initial_inputs() {
         state
-            .load_initial_inputs(&mut fuzzer, &mut executor, &mut mgr, &[seed_dir.clone()])
+            .load_initial_inputs(
+                &mut fuzzer,
+                &mut executor,
+                &mut mgr,
+                std::slice::from_ref(seed_dir),
+            )
             .unwrap_or_else(|_| {
                 println!("Failed to load initial corpus at {:?}", &seed_dir);
                 process::exit(0);
@@ -951,7 +1291,10 @@ fn fuzz(
     }
     log.replace(OpenOptions::new().append(true).create(true).open(logfile)?);
 
-    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
+    let fuzz_result = fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr);
+    let export_result = maybe_export_runtime_data(&mut state, true);
+    fuzz_result?;
+    export_result?;
 
     Ok(())
 }

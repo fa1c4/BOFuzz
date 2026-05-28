@@ -3,7 +3,7 @@ use crate::feature_sched::metadata::{
 };
 use crate::feature_sched::{
     get_active_dim, get_active_feature_names, get_v_candidates, replace_v_candidates,
-    set_current_weight_vec, set_tpe_satisfied,
+    set_current_weight_vec, set_schema_info, set_tpe_satisfied,
 };
 use libafl::common::HasMetadata;
 use libafl::Error;
@@ -19,6 +19,24 @@ pub const EPS: f64 = 1e-6;
 const LEGACY_KEYS: &[&str] = &[
     "imme", "strc", "mem", "arith", "indeg", "offsp", "btw", "depth",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateFilePolicy {
+    AllowExternalFile,
+    IgnoreExternalFile,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CandidateFileStatus {
+    pub path: Option<PathBuf>,
+    pub loaded: bool,
+}
+
+pub struct FeatureMapLoadResult {
+    pub feats: Vec<f64>,
+    pub active_matrix: HashMap<String, Vec<f64>>,
+    pub candidate_status: CandidateFileStatus,
+}
 
 pub fn load_and_validate_schema(path: &Path) -> Result<FeatureSchemaFile, String> {
     let mut f = File::open(path).map_err(|e| {
@@ -317,7 +335,7 @@ pub fn load_and_validate_feature_map(
     Ok(result)
 }
 
-fn equal_simplex(d: usize) -> Vec<f64> {
+pub fn equal_simplex(d: usize) -> Vec<f64> {
     if d == 0 {
         return Vec::new();
     }
@@ -430,51 +448,75 @@ fn load_candidates_from(path: &Path, active_dim: usize) -> Result<Vec<Vec<f64>>,
     Ok(out)
 }
 
-/// Load user-provided candidate vectors. Candidate file absent -> empty pool.
-/// Candidate file present but invalid -> fatal error (returns Err).
+/// Load user-provided candidate vectors according to the selected mask policy.
+/// Candidate file absent -> empty pool. Candidate file present but invalid ->
+/// fatal error only when external files are allowed by policy.
 pub fn ensure_v_candidates_for<S: HasMetadata>(
     state: &mut S,
     features_map_path: &Path,
     active_dim: usize,
-) -> Result<(), String> {
-    if !get_v_candidates(state).is_empty() {
-        return Ok(());
+    policy: CandidateFilePolicy,
+    mode_label: &str,
+) -> Result<CandidateFileStatus, String> {
+    let candidate_path = derive_dir_and_target(features_map_path)
+        .map(|(dir, tgt)| dir.join(format!("{}_v_candidates.json", tgt)));
+
+    if policy == CandidateFilePolicy::IgnoreExternalFile {
+        eprintln!(
+            "[BOFuzz candidate] mode={} policy=ignored reason=adaptive_mask_requires_credit_initialized_tpe",
+            mode_label
+        );
+        return Ok(CandidateFileStatus {
+            path: candidate_path,
+            loaded: false,
+        });
     }
 
-    let cands = match derive_dir_and_target(features_map_path) {
-        Some((dir, tgt)) => {
-            let cand_path = dir.join(format!("{}_v_candidates.json", tgt));
-            if cand_path.exists() {
-                let file_cands = load_candidates_from(&cand_path, active_dim).map_err(|e| {
-                    format!(
-                        "BOFuzz candidate error: invalid {}: {}",
-                        cand_path.display(),
-                        e
-                    )
-                })?;
-                eprintln!(
-                    "[BOFuzz] Reading simplex v candidates file: {}",
-                    cand_path.display()
-                );
-                file_cands
-            } else {
-                eprintln!(
-                    "[BOFuzz] No v-candidates file at {}; TPE will sample from explore credits.",
-                    cand_path.display()
-                );
-                Vec::new()
-            }
-        }
-        None => {
-            eprintln!(
-                "[BOFuzz] Cannot derive v-candidates path; TPE will sample from explore credits."
-            );
-            Vec::new()
-        }
+    if !get_v_candidates(state).is_empty() {
+        return Ok(CandidateFileStatus {
+            path: candidate_path,
+            loaded: false,
+        });
+    }
+
+    let Some(cand_path) = candidate_path else {
+        eprintln!(
+            "[BOFuzz] Cannot derive v-candidates path; TPE will sample from explore credits."
+        );
+        replace_v_candidates(state, Vec::new());
+        return Ok(CandidateFileStatus::default());
     };
 
-    replace_v_candidates(state, cands);
-    Ok(())
+    if cand_path.exists() {
+        let file_cands = load_candidates_from(&cand_path, active_dim).map_err(|e| {
+            format!(
+                "BOFuzz candidate error: invalid {}: {}",
+                cand_path.display(),
+                e
+            )
+        })?;
+        eprintln!(
+            "[BOFuzz candidate] mode={} source=external-file priority=override-credit-init path={} active_dim={}",
+            mode_label,
+            cand_path.display(),
+            active_dim
+        );
+        replace_v_candidates(state, file_cands);
+        Ok(CandidateFileStatus {
+            path: Some(cand_path),
+            loaded: true,
+        })
+    } else {
+        eprintln!(
+            "[BOFuzz] No v-candidates file at {}; TPE will sample from explore credits.",
+            cand_path.display()
+        );
+        replace_v_candidates(state, Vec::new());
+        Ok(CandidateFileStatus {
+            path: Some(cand_path),
+            loaded: false,
+        })
+    }
 }
 
 pub fn combine_feature_matrix_to_weights(
@@ -538,6 +580,7 @@ fn filter_active_features(
     active_map
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn load_and_align_features_map<S: HasMetadata>(
     state: &mut S,
     canonical_map: &HashMap<String, Vec<f64>>,
@@ -545,8 +588,16 @@ pub fn load_and_align_features_map<S: HasMetadata>(
     active_dim: usize,
     active_feature_names: &[String],
     features_map_path: &Path,
-) -> Result<(Vec<f64>, HashMap<String, Vec<f64>>), String> {
-    ensure_v_candidates_for(state, features_map_path, active_dim)?;
+    candidate_policy: CandidateFilePolicy,
+    mode_label: &str,
+) -> Result<FeatureMapLoadResult, String> {
+    let candidate_status = ensure_v_candidates_for(
+        state,
+        features_map_path,
+        active_dim,
+        candidate_policy,
+        mode_label,
+    )?;
 
     let v0_active: Vec<f64> = get_v_candidates(state)
         .first()
@@ -563,7 +614,53 @@ pub fn load_and_align_features_map<S: HasMetadata>(
     aligned.resize(sites, 0.0);
     aligned.truncate(sites);
 
-    Ok((aligned, active_map))
+    Ok(FeatureMapLoadResult {
+        feats: aligned,
+        active_matrix: active_map,
+        candidate_status,
+    })
+}
+
+pub fn install_committed_runtime_mask<S: HasMetadata>(
+    state: &mut S,
+    schema: &FeatureSchemaFile,
+    mask: &[bool],
+) -> Result<(), Error> {
+    if mask.len() != schema.features.len() {
+        return Err(Error::illegal_argument(format!(
+            "BOFuzz mask error: committed mask length {} != schema_dim {}",
+            mask.len(),
+            schema.features.len()
+        )));
+    }
+    if mask.iter().all(|enabled| !*enabled) {
+        return Err(Error::illegal_argument(
+            "BOFuzz mask error: committed mask disables every schema feature".to_string(),
+        ));
+    }
+
+    let active_features = compute_active_features(schema, mask);
+    let active_feature_names = active_features
+        .iter()
+        .map(|feature| feature.name.clone())
+        .collect::<Vec<_>>();
+
+    set_schema_info(
+        state,
+        schema.schema_version,
+        schema.features.clone(),
+        mask.to_vec(),
+        active_features,
+    );
+
+    if let Some(matrix) = state.metadata_map_mut().get_mut::<FeaturesMatrixMeta>() {
+        matrix.matrix = filter_active_features(&matrix.matrix, &active_feature_names);
+    }
+
+    replace_v_candidates(state, Vec::new());
+    set_current_weight_vec(state, Vec::new());
+    set_tpe_satisfied(state, !active_feature_names.is_empty());
+    Ok(())
 }
 
 /// Apply a simplex feature-weight vector to recompute the scalar feature map.

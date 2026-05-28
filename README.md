@@ -21,7 +21,7 @@ BOFuzz/static_analysis/features_schema.json
 ```
 
 This file defines the 16 canonical features (I00–I07 instruction-level, S00–S07 structural-level)
-with `schema_version: 3`. The runtime will not start without it.
+with `schema_version: 4`. The runtime will not start without it.
 
 ## Build
 
@@ -78,36 +78,38 @@ Each feature array must have length equal to `sancov_sites`. Legacy 8-key maps a
 
 ## `--vec-mask`
 
-Controls which features are active, aligned to `features_schema.json` order.
+Controls the feature coordinate space, aligned to `features_schema.json` order.
 
 ```bash
 --vec-mask='1111111111111111'   # all 16 enabled
 --vec-mask='1111111100000000'   # instruction-only (8 active)
 --vec-mask='0000000011111111'   # structural-only (8 active)
 --vec-mask='1111111111111110'   # disable centrality (15 active)
+--vec-mask auto-credit --credit-top-k 8
 ```
 
-Mask length must equal `features_schema.json.features.len()`. All-zero mask is fatal.
+Mask length must equal `features_schema.json.features.len()`. All-zero masks are fatal. Explicit masks are immutable for the full run, and inactive dimensions are omitted from Explore credits, runtime credits, and TPE vectors.
+
+Auto-credit explores with the full schema, selects at most `--credit-top-k` strictly positive frontier-credit features before the first TPE vector, and freezes that selected mask. If fewer than `k` features have positive credit, only those positive features are selected. If all credits are zero, BOFuzz falls back to full schema with an equal-simplex initialization.
 
 ## Active-Dim TPE Vector Format
 
-Every TPE vector is `[alpha, active_weight_0, ..., active_weight_{active_dim-1}]`.
-No placeholder zeros for disabled dimensions.
+Every TPE vector is `[active_weight_0, ..., active_weight_{active_dim-1}]`.
+No alpha entries and no placeholder zeros for disabled dimensions. Credit-based initialization enqueues the exact normalized Explore-credit vector first, then random neighboring samples.
 
 ## Candidate File Format
 
-`{target}_v_candidates.json` must contain vectors of length `1 + active_dim`:
+`{target}_v_candidates.json` must contain weights-only vectors of length `active_dim`:
 ```json
 [
-  [0.5, 0.354, 0.354, 0.354, 0.354, 0.354, 0.354, 0.354, 0.354]
+  [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125]
 ]
 ```
-If `--vec-mask` changes, candidate files must be regenerated.
+For full-schema and explicit-mask modes, a valid candidate file keeps priority over Explore-credit initialization. For auto-credit mode, candidate files are always ignored and are not parsed or validated. If an explicit `--vec-mask` changes, candidate files must be regenerated.
 
-## Default Candidate Order
+## Runtime Data
 
-BOFuzz no longer accepts user prior-order files. Default candidate order is
-deterministic: uniform first, then one-hot candidates in active schema order.
+BOFuzz writes `<output_root>/runtime_data.json` atomically. It records mask policy, selected features, initialization source, Explore credits, post-Explore runtime credits, and TPE history with coordinate feature names kept separate for each vector space.
 
 ## Usage
 
@@ -135,6 +137,11 @@ cd example
 chmod +x zlib_uncompress_demo.sh
 ./zlib_uncompress_demo.sh
 ```
+
+The demo rebuilds the latest BOFuzz engine, clones zlib, compiles the fuzzer,
+runs `static_analysis/features_extractor.py` with IDA/IDALIB from
+`IDA_DIR` (default `~/ida-pro-9.3`), then fuzzes with `--vec-mask auto-credit`,
+10 minutes of Explore, and a 5-minute TPE period.
 
 ## Static Feature Extraction
 
@@ -286,7 +293,7 @@ Exits 0 on success.
 |---|---|---|
 | `--features-schema` | auto-detected | Path to `features_schema.json` |
 | `--features-map` | `{exe}_features_map.json` | Path to feature map |
-| `--vec-mask` | all enabled | Feature mask (bitstring, bracketed, or comma-separated) |
+| `--vec-mask` | all enabled | Feature mask (bitstring, bracketed, comma-separated) or `auto-credit` |
 | `--feat-mode` | `1` | 0=off, 1=weight scheduling, 2=power scheduling, 3=both |
 | `--explore-time-secs` | `43200` | Cold start explore time in **seconds** |
 | `--tpe-period-secs` | `600` | TPE iteration period in **seconds** |
@@ -295,6 +302,7 @@ Exits 0 on success.
 | `--gmin` | `0.5` | Factor range minimum |
 | `--gmax` | `3.0` | Factor range maximum |
 | `--tanh` | `false` | Use tanh mapping instead of exp |
+| `--credit-top-k` | `8` | Maximum positive-credit features selected by `--vec-mask auto-credit` |
 
 ## Strict Failure Behavior
 
@@ -304,5 +312,5 @@ Exits 0 on success.
 - All-zero mask → fatal
 - Feature map present but invalid → fatal
 - Feature map missing → cold fuzzing fallback
-- Candidate file present but wrong format → fatal
+- Candidate file present but wrong format → fatal in full/explicit modes; ignored in auto-credit mode
 - Prior-order index out of range or duplicate → fatal

@@ -113,7 +113,7 @@ where
 
             if let Some(u) = client.user_monitor.remove("features-info") {
                 if let UserStatsValue::String(s) = u.value() {
-                    if let Some(parsed) = parse_features_info(&s) {
+                    if let Some(parsed) = parse_features_info(s) {
                         let mut extra = String::new();
                         use std::fmt::Write as _;
                         write!(
@@ -133,7 +133,7 @@ where
 
             if let Some(u) = client.user_monitor.remove("tpe-info") {
                 if let UserStatsValue::String(s) = u.value() {
-                    if let Some(parsed) = parse_tpe_info(&s) {
+                    if let Some(parsed) = parse_tpe_info(s) {
                         let mut extra = String::new();
                         use std::fmt::Write as _;
                         write!(

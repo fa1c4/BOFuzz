@@ -15,7 +15,8 @@ use super::features_map::EPS;
 use super::frontier::{local_frontier_nodes, update_frontier_meta};
 use super::metadata::{
     CoverageDeltaMeta, ExploreCreditEntry, ExploreCreditHistoryMeta, ExploreCreditMeta,
-    FeaturesMatrixMeta, SancovAcfgMeta, SancovIndexesMetadata, TpeIterationMeta,
+    FeaturesMatrixMeta, RuntimeCreditEntry, RuntimeCreditHistoryMeta, RuntimeCreditMeta,
+    SancovAcfgMeta, SancovIndexesMetadata, TpeIterationMeta, TpePhase,
 };
 use crate::feature_sched::get_active_feature_names;
 
@@ -137,40 +138,78 @@ where
             }
         }
 
-        let iteration = state
+        let tpe_meta = state
             .metadata_map()
             .get::<TpeIterationMeta>()
-            .map(|m| m.current_iteration)
-            .unwrap_or(delta.iteration);
+            .cloned()
+            .unwrap_or_default();
+        let iteration = if tpe_meta.current_iteration == 0 {
+            delta.iteration
+        } else {
+            tpe_meta.current_iteration
+        };
+        let phase = tpe_meta.phase;
 
-        let cumulative = {
-            let meta = state
+        if phase == TpePhase::Explore {
+            let cumulative = {
+                let meta = state
+                    .metadata_map_mut()
+                    .get_or_insert_with::<ExploreCreditMeta>(Default::default);
+                if meta.credits.len() != active_names.len() {
+                    meta.credits.resize(active_names.len(), 0.0);
+                }
+                meta.iteration = iteration;
+                meta.total_delta_edges = meta.total_delta_edges.saturating_add(delta.delta_edges);
+                for (c, d) in meta.credits.iter_mut().zip(credit_delta.iter()) {
+                    *c = (*c + *d).max(0.0);
+                }
+                meta.credits.clone()
+            };
+
+            let entry = ExploreCreditEntry {
+                iteration,
+                corpus_id: None,
+                delta_edges: delta.delta_edges,
+                frontier_nodes: local_nodes,
+                credit_delta,
+                cumulative_credits: cumulative,
+            };
+            state
                 .metadata_map_mut()
-                .get_or_insert_with::<ExploreCreditMeta>(Default::default);
-            if meta.credits.len() != active_names.len() {
-                meta.credits.resize(active_names.len(), 0.0);
-            }
-            meta.iteration = iteration;
-            meta.total_delta_edges = meta.total_delta_edges.saturating_add(delta.delta_edges);
-            for (c, d) in meta.credits.iter_mut().zip(credit_delta.iter()) {
-                *c = (*c + *d).max(0.0);
-            }
-            meta.credits.clone()
-        };
+                .get_or_insert_with::<ExploreCreditHistoryMeta>(Default::default)
+                .entries
+                .push(entry);
+        } else {
+            let cumulative = {
+                let meta = state
+                    .metadata_map_mut()
+                    .get_or_insert_with::<RuntimeCreditMeta>(Default::default);
+                if meta.credits.len() != active_names.len() {
+                    meta.credits.resize(active_names.len(), 0.0);
+                }
+                meta.iteration = iteration;
+                meta.total_delta_edges = meta.total_delta_edges.saturating_add(delta.delta_edges);
+                for (c, d) in meta.credits.iter_mut().zip(credit_delta.iter()) {
+                    *c = (*c + *d).max(0.0);
+                }
+                meta.credits.clone()
+            };
 
-        let entry = ExploreCreditEntry {
-            iteration,
-            corpus_id: None,
-            delta_edges: delta.delta_edges,
-            frontier_nodes: local_nodes,
-            credit_delta,
-            cumulative_credits: cumulative,
-        };
-        state
-            .metadata_map_mut()
-            .get_or_insert_with::<ExploreCreditHistoryMeta>(Default::default)
-            .entries
-            .push(entry);
+            let entry = RuntimeCreditEntry {
+                iteration,
+                phase,
+                corpus_id: None,
+                delta_edges: delta.delta_edges,
+                frontier_nodes: local_nodes,
+                credit_delta,
+                cumulative_credits: cumulative,
+            };
+            state
+                .metadata_map_mut()
+                .get_or_insert_with::<RuntimeCreditHistoryMeta>(Default::default)
+                .entries
+                .push(entry);
+        }
 
         Ok(())
     }

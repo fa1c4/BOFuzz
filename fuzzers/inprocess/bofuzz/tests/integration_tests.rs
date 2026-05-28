@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -160,6 +159,7 @@ fn write_valid_schema(dir: &Path) -> std::path::PathBuf {
     path
 }
 
+#[allow(dead_code)]
 fn write_synthetic_feature_map(dir: &Path, sites: usize) -> std::path::PathBuf {
     let names = [
         "bb_instruction_count",
@@ -340,8 +340,8 @@ fn test_instruction_only_mask_gives_active_dim_8() {
     let path = write_valid_schema(tmp.path());
     let schema = load_and_validate_schema(&path).unwrap();
     let mut mask = vec![false; 16];
-    for i in 0..8 {
-        mask[i] = true;
+    for item in mask.iter_mut().take(8) {
+        *item = true;
     }
     let active = compute_active_features(&schema, &mask);
     assert_eq!(active.len(), 8);
@@ -400,7 +400,7 @@ fn test_candidate_len_mismatch_detected() {
 
 #[test]
 fn test_candidate_zero_norm_detected() {
-    let cand = vec![0.5, 0.0, 0.0, 0.0];
+    let cand = [0.5, 0.0, 0.0, 0.0];
     let weights = &cand[1..];
     let norm = weights.iter().map(|x| x * x).sum::<f64>().sqrt();
     assert_eq!(norm, 0.0, "Zero-norm weights should be detected");
@@ -426,14 +426,14 @@ fn test_legacy_key_btw_is_rejected() {
 
 #[test]
 fn test_zero_norm_vector_is_invalid() {
-    let weights = vec![0.0, 0.0, 0.0, 0.0];
+    let weights = [0.0, 0.0, 0.0, 0.0];
     let norm = weights.iter().map(|x| x * x).sum::<f64>().sqrt();
     assert!(norm <= 0.0, "Zero-norm vector should be rejected");
 }
 
 #[test]
 fn test_nonfinite_weight_is_invalid() {
-    let weights = vec![1.0, f64::NAN, 0.5];
+    let weights = [1.0, f64::NAN, 0.5];
     let has_nonfinite = weights.iter().any(|x| !x.is_finite());
     assert!(has_nonfinite, "Non-finite weight should be detected");
 }
